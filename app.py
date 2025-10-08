@@ -1142,7 +1142,7 @@ def run():
 
         if not ponds_of_type:
             st.warning(f"暂无【{pt_sel}】类型的池塘")
-            st.stop()
+
 
         # ② 池子多选
         pond_id_to_label = {p["id"]: f"{p['name']}  （当前 {p['current']} 只）"
