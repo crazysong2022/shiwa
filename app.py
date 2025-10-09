@@ -126,8 +126,8 @@ def init_user_table():
 
 TRANSFER_PATH_RULES = {
     "种蛙池": ["商品蛙池","三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "试验池"],
-    "孵化池": ["养殖池", "试验池"],
-    "养殖池": ["商品蛙池", "种蛙池", "试验池"],
+    "孵化池": ["养殖池", "试验池", "孵化池"],
+    "养殖池": ["商品蛙池", "种蛙池", "三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "试验池"],
     "商品蛙池": ["三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "试验池"],
     "试验池": ["三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池"],
 }
@@ -183,7 +183,6 @@ def execute_safe_select(sql: str) -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn)
 # ==========================================
-
 def get_recent_movements(limit=20):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -194,13 +193,14 @@ def get_recent_movements(limit=20):
                    WHEN 'purchase' THEN '外购'
                    WHEN 'hatch'    THEN '孵化'
                    WHEN 'sale'     THEN '销售出库'
-                   WHEN 'death'    THEN '死亡'   -- ✅ 新增这一行
+                   WHEN 'death'    THEN '死亡'
                END AS movement_type,
                fp.name   AS from_name,
                tp.name   AS to_name,
                sm.quantity,
                sm.description,
-               sm.moved_at
+               sm.moved_at,
+               sm.created_by AS 操作人
         FROM stock_movement_shiwa sm
         LEFT JOIN pond_shiwa fp ON sm.from_pond_id = fp.id
         LEFT JOIN pond_shiwa tp ON sm.to_pond_id = tp.id
@@ -231,18 +231,31 @@ def get_all_ponds():
     return rows
 
 
-def add_feeding_record(pond_id, feed_type_id, weight_kg, unit_price, notes, fed_at=None, fed_by=None):
+def add_feeding_record(pond_id, feed_type_id, weight_kg, unit_price, notes,
+                       fed_at=None, fed_by=None):
     fed_at = fed_at or datetime.utcnow()
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO feeding_record_shiwa
-        (pond_id, feed_type_id, feed_weight_kg, unit_price_at_time, notes, fed_at, fed_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s);
-    """, (pond_id, feed_type_id, weight_kg, unit_price, notes, fed_at, fed_by))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        # ① 先扣饲料库存
+        cur.execute("SELECT stock_kg FROM feed_type_shiwa WHERE id = %s FOR UPDATE;", (feed_type_id,))
+        row = cur.fetchone()
+        if not row or row[0] < weight_kg:
+            raise ValueError("该饲料库存不足，无法投喂！")
+        cur.execute("UPDATE feed_type_shiwa SET stock_kg = stock_kg - %s WHERE id = %s;", (weight_kg, feed_type_id))
+
+        # ② 写入喂养记录（不再给 total_cost）
+        cur.execute("""
+            INSERT INTO feeding_record_shiwa
+            (pond_id, feed_type_id, feed_weight_kg, unit_price_at_time, notes, fed_at, fed_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+        """, (pond_id, feed_type_id, weight_kg, unit_price, notes, fed_at, fed_by))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        cur.close(); conn.close()
 
 
 def get_feed_types():
@@ -450,17 +463,16 @@ def _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type):
         VALUES (%s, %s, %s, %s, CURRENT_DATE, %s)
     """, (movement_id, to_pond_id, frog_type_id, quantity, stage))
 def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
-                       description, unit_price=None):
+                       description, unit_price=None, created_by=None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # ===== 原有逻辑开始 =====
         cur.execute("""
             INSERT INTO stock_movement_shiwa
-            (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id;
-        """, (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price))
+        """, (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by))
         movement_id = cur.fetchone()[0]
 
         # 更新目标池
@@ -495,20 +507,17 @@ def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
         cur.close()
         conn.close()
 
-def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_files=None):
-    """
-    记录死亡出库 + 可选上传多张图片
-    """
+def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_files=None, created_by: str = None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         # 1. 写入死亡记录
         cur.execute("""
             INSERT INTO stock_movement_shiwa
-            (movement_type, from_pond_id, to_pond_id, quantity, description)
-            VALUES ('death', %s, NULL, %s, %s)
+            (movement_type, from_pond_id, to_pond_id, quantity, description, created_by)
+            VALUES ('death', %s, NULL, %s, %s, %s)
             RETURNING id;
-        """, (from_pond_id, quantity, note or f"死亡 {quantity} 只"))
+        """, (from_pond_id, quantity, note or f"死亡 {quantity} 只", created_by))
         movement_id = cur.fetchone()[0]
 
         # 2. 扣减源池
@@ -549,19 +558,20 @@ def get_recent_death_records(limit=20):
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT 
-            sm.id,
-            p.name AS pond_name,
-            sm.quantity,
-            sm.description,
-            sm.moved_at,
-            di.image_path
-        FROM stock_movement_shiwa sm
-        JOIN pond_shiwa p ON sm.from_pond_id = p.id
-        LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
-        WHERE sm.movement_type = 'death'
-        ORDER BY sm.moved_at DESC
-        LIMIT %s;
+            SELECT 
+        sm.id,
+        p.name AS pond_name,
+        sm.quantity,
+        sm.description,
+        sm.moved_at,
+        di.image_path,
+        sm.created_by AS 操作人
+    FROM stock_movement_shiwa sm
+    JOIN pond_shiwa p ON sm.from_pond_id = p.id
+    LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
+    WHERE sm.movement_type = 'death'
+    ORDER BY sm.moved_at DESC
+    LIMIT %s;
     """, (limit,))
     rows = cur.fetchall()
     cur.close()
@@ -584,6 +594,24 @@ def get_pond_type_map():
     cur.close()
     conn.close()
     return mapping
+# 新增
+def get_frog_purchase_types():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, unit_price FROM frog_purchase_type_shiwa ORDER BY id;")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+def add_frog_purchase_type(name, price):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO frog_purchase_type_shiwa (name, unit_price)
+        VALUES (%s, %s)
+        ON CONFLICT (name) DO UPDATE SET unit_price = EXCLUDED.unit_price;
+    """, (name, price))
+    conn.commit(); cur.close(); conn.close()
 # ---------- 客户 ----------
 def get_customers():
     conn = get_db_connection()
@@ -605,35 +633,36 @@ def add_customer(name, phone, ctype):
     return cid
 
 # ---------- 销售 ----------
-def do_sale(pond_id, customer_id, sale_type, qty, unit_price, note=""):
-    """成交 + 扣库存 + 写 movement"""
+def do_sale(pond_id, customer_id, sale_type, qty_zhi, unit_price_per_zhi, 
+            weight_jin=None, note="", sold_by=None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 1. 销售记录
+        # ❌ 不要计算 total_amount，也不要插入它！
         cur.execute("""
-            INSERT INTO sale_record_shiwa (pond_id, customer_id, sale_type, quantity, unit_price, note)
-            VALUES (%s,%s,%s,%s,%s,%s);
-        """, (pond_id, customer_id, sale_type, qty, unit_price, note))
-
-        # 2. 扣库存
-        cur.execute(
-            "UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;",
-            (qty, pond_id)
-        )
-
-        # 3. ⭐ 把销售当成"出库"记录，movement_type = 'sale'
+            INSERT INTO sale_record_shiwa 
+            (pond_id, customer_id, sale_type, quantity, unit_price, 
+             weight_jin, note, sold_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        """, (
+            pond_id, customer_id, sale_type, qty_zhi, unit_price_per_zhi,
+            weight_jin, note, sold_by
+        ))
+        # 扣库存
+        cur.execute("UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;",
+                    (qty_zhi, pond_id))
+        # 记录 movement
         cur.execute("""
             INSERT INTO stock_movement_shiwa (movement_type, from_pond_id, to_pond_id, quantity, description)
             VALUES ('sale', %s, NULL, %s, %s);
-        """, (pond_id, qty, f"销售：{sale_type} {qty} 只，单价{unit_price}元"))
-
+        """, (pond_id, qty_zhi, f"销售：{sale_type} {weight_jin} 斤"))
         conn.commit()
     except Exception as e:
         conn.rollback()
         raise
     finally:
-        cur.close(); conn.close()
+        cur.close()
+        conn.close()
 
 # ---------- 最近销售 ----------
 def get_recent_sales(limit=20):
@@ -991,12 +1020,62 @@ def run():
         st.session_state.logged_in = False
         st.session_state.user = None
         st.rerun()
+    # >>>>>>>>>>>>>>>>>> 在这里插入新函数定义 <<<<<<<<<<<<<<<<<<
+    def get_frog_purchase_types_with_qty():
+        """获取蛙型 + 数量（含 quantity 字段）"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, unit_price, COALESCE(quantity, 0) FROM frog_purchase_type_shiwa ORDER BY id;")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
 
+    def allocate_frog_purchase(frog_type_id, to_pond_id, quantity, description, created_by):
+        """从 frog_purchase_type_shiwa 库存分配到池塘"""
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            # 1. 检查库存是否足够
+            cur.execute("SELECT quantity FROM frog_purchase_type_shiwa WHERE id = %s;", (frog_type_id,))
+            row = cur.fetchone()
+            if not row or row[0] < quantity:
+                return False, "库存不足，无法分配"
+
+            # 2. 写入 stock_movement_shiwa（movement_type = 'purchase'）
+            cur.execute("""
+                INSERT INTO stock_movement_shiwa
+                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by)
+                VALUES ('purchase', NULL, %s, %s, %s, 
+                        (SELECT unit_price FROM frog_purchase_type_shiwa WHERE id = %s),
+                        %s)
+                RETURNING id;
+            """, (to_pond_id, quantity, description, frog_type_id, created_by))
+            movement_id = cur.fetchone()[0]
+
+            # 3. 增加目标池数量
+            cur.execute("UPDATE pond_shiwa SET current_count = current_count + %s WHERE id = %s;", (quantity, to_pond_id))
+
+            # 4. 扣减 frog_purchase_type_shiwa 库存
+            cur.execute("UPDATE frog_purchase_type_shiwa SET quantity = quantity - %s WHERE id = %s;", (quantity, frog_type_id))
+
+            # 5. 记录生命周期（可选）
+            _log_life_start(conn, movement_id, to_pond_id, quantity, 'purchase')
+
+            conn.commit()
+            return True, None
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)
+        finally:
+            cur.close()
+            conn.close()
+    # >>>>>>>>>>>>>>>>>> 函数定义结束 <<<<<<<<<<<<<<<<<<
     st.markdown("---")
     # 创建三个 Tab（你原有的 7 个 Tab）
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["📊 池塘总览", "🍽️ 喂养日志", "➕ 池塘创建", "🔄 孵转池与外购", 
-         "🪱 饲料类型", "💰 销售记录", "📈 投资回报（ROI）"]
+         "🪱 采购类型", "💰 销售记录", "📈 投资回报（ROI）"]
     )
 
 
@@ -1156,12 +1235,17 @@ def run():
 
         # ③ 饲料多选
         feed_id_to_info = {f[0]: {"name": f[1], "price": f[2]} for f in feed_types}
-        selected_feed_ids = st.multiselect(
-            "3. 饲料类型（可多选）",
-            options=list(feed_id_to_info.keys()),
-            format_func=lambda x: f"{feed_id_to_info[x]['name']} (¥{feed_id_to_info[x]['price']}/kg)",
-            default=[list(feed_id_to_info.keys())[0]]
-        )
+        # ③ 饲料多选 - 空字典保护
+        if not feed_id_to_info:                       # 数据库里一条饲料都没有
+            st.info("暂无饲料数据，请在「Tab5 · 采购类型」先添加饲料")
+            selected_feed_ids = []                    # 给空列表，后续逻辑不会崩
+        else:
+            selected_feed_ids = st.multiselect(
+                "3. 饲料类型（可多选）",
+                options=list(feed_id_to_info.keys()),
+                format_func=lambda x: feed_id_to_info[x]["name"],
+                default=[]                            # 再也不取 [0]
+            )
 
         # ④ 重量输入（搬出表单，实时渲染，只画选中的）
         st.markdown("4. 为每种饲料输入**总投喂量 (kg)**（将均摊到所选池塘）")
@@ -1642,546 +1726,671 @@ def run():
                     except Exception as e:
                         st.error(f"❌ 清空失败: {e}")
    
-        # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
+    # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
-        st.subheader("🔄 转池 / 外购 / 孵化操作")
-        
+        st.subheader("🔄 转池 / 外购 / 孵化 / 死亡操作")
+
         # ---- 系统提醒 ----
         conn = get_db_connection()
         reminds = pd.read_sql("SELECT * FROM pond_reminder_v", conn)
         conn.close()
-
         if reminds.empty:
             st.info("✅ 当前无阶段提醒，所有批次正常生长")
         else:
             st.warning("⚠️ 有以下批次到达关键阶段，请及时处理！")
             for _, r in reminds.iterrows():
-                st.markdown(
-                    f"- **{r.pond_name}**（{r.frog_type}）"
-                    f" **{r.quantity}只** 已养 **{r.days_elapsed}天**，"
-                    f" 预计 **{r.days_left}天后**进入 **{r.next_stage}**"
-                )
+                st.markdown(f"- **{r.pond_name}**（{r.frog_type}）"
+                            f" **{r.quantity}只** 已养 **{r.days_elapsed}天**，"
+                            f" 预计 **{r.days_left}天后**进入 **{r.next_stage}**")
         st.markdown("---")
-        operation = st.radio("操作类型", ["转池", "外购", "孵化", "死亡"], horizontal=True, key="op_type")
+
+        operation = st.radio("操作类型", ["转池", "外购", "孵化", "死亡"],
+                            horizontal=True, key="tab4_op_radio")
 
         ponds = get_all_ponds()
         if not ponds:
             st.warning("请先创建至少一个池塘！")
-        else:
-            pond_id_to_info = {p[0]: {
-                "name": p[1], "pond_type": p[2].strip(),
-                "frog_type": p[3], "max_capacity": p[4], "current_count": p[5]
-            } for p in ponds}
+            st.stop()
 
-            grouped = group_ponds_by_type(pond_id_to_info)
+        pond_id_to_info = {p[0]: {"name": p[1], "pond_type": p[2].strip(),
+                                "frog_type": p[3], "max_capacity": p[4], "current_count": p[5]}
+                        for p in ponds}
+        grouped = group_ponds_by_type(pond_id_to_info)
 
-            # ========== 死亡：独立表单 ==========
-            if operation == "死亡":
-                src_grouped = grouped
-                if not src_grouped:
-                    st.error("❌ 无可用的转出池类型")
-                else:
-                    from_pond_id = pond_selector("源池塘（死亡出库）", pond_id_to_info, src_grouped, "death_src")
-                    current = pond_id_to_info[from_pond_id]["current_count"]
-                    if current == 0:
-                        st.error("该池当前数量为 0，无法记录死亡！")
-                    else:
-                        with st.form("death_record_form", clear_on_submit=True):
-                            quantity = st.number_input("死亡数量", min_value=1, max_value=current, step=1)
-                            note = st.text_area("备注（选填）", placeholder="如：病害、天气、人为等")
-
-                            # ✅ 仅保留多文件上传
-                            uploaded_files = st.file_uploader(
-                                "上传死亡现场照片（可一次选多张）",
-                                type=["png", "jpg", "jpeg"],
-                                accept_multiple_files=True,
-                                key="death_images_upload"
-                            )
-
-                            submitted = st.form_submit_button("✅ 记录死亡", type="primary")
-                            if submitted:
-                                ok, msg = add_death_record(from_pond_id, quantity, note, uploaded_files)
-                                if ok:
-                                    st.success(f"✅ 死亡记录成功：{quantity} 只")
-                                    st.rerun()
-                                else:
-                                    st.error(f"❌ 记录失败：{msg}")
-
-            # ========== 转池 / 外购 / 孵化：共用流程 ==========
+        # ========== 死亡 ==========
+        if operation == "死亡":
+            src_grouped = grouped
+            if not src_grouped:
+                st.error("❌ 无可用的转出池类型")
             else:
-                from_pond_id = None
-                to_pond_id = None
-                purchase_price = None
-                default_qty = 1000  # 默认数量（会被孵化覆盖）
-
-                if operation == "外购":
-                    to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "purchase")
-                    purchase_price = st.number_input(
-                        "外购单价 (元/只)",
-                        min_value=0.1, value=20.0, step=1.0, format="%.2f",
-                        help="请输入每只蛙的采购价格"
-                    )
-
-                elif operation == "孵化":
-                    hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
-                    if not hatch_grouped:
-                        st.error("❌ 请先至少创建一个‘孵化池’")
-                    else:
-                        to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
-                        purchase_price = None  # 孵化无成本
-
-                        # === 板数快捷输入（仅用于孵化）===
-                        plate_input = st.text_input(
-                            "🥚 按板输入（1板 = 500只，如：1、1/2、2/3）",
-                            placeholder="留空则手动输入数量",
-                            key="hatch_plate_input"
+                from_pond_id = pond_selector("源池塘（死亡出库）", pond_id_to_info, src_grouped, "death_src")
+                current = pond_id_to_info[from_pond_id]["current_count"]
+                if current == 0:
+                    st.error("该池当前数量为 0，无法记录死亡！")
+                else:
+                    with st.form("death_record_form", clear_on_submit=True):
+                        quantity = st.number_input("死亡数量", min_value=1, max_value=current, step=1,
+                                                key="death_qty")
+                        note = st.text_area("备注（选填）", placeholder="如：病害、天气、人为等",
+                                        key="death_note")
+                        uploaded_files = st.file_uploader(
+                            "上传死亡现场照片（可一次选多张）",
+                            type=["png", "jpg", "jpeg"],
+                            accept_multiple_files=True,
+                            key="death_images"
                         )
-                        if plate_input.strip():
-                            try:
-                                if '/' in plate_input:
-                                    num, den = plate_input.split('/')
-                                    plate_val = float(num) / float(den)
-                                else:
-                                    plate_val = float(plate_input)
-                                default_qty = int(round(plate_val * 500))
-                                if default_qty < 1:
-                                    default_qty = 1
-                            except:
-                                st.warning(f"板数格式无效：{plate_input}，将使用默认值 1000")
-                                default_qty = 1000
+                        submitted = st.form_submit_button("✅ 记录死亡", type="primary")
+                        if submitted:
+                            current_user = st.session_state.user['username']
+                            ok, msg = add_death_record(from_pond_id, quantity, note,
+                                                    uploaded_files, created_by=current_user)
+                            if ok:
+                                st.success(f"✅ 死亡记录成功：{quantity} 只")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ 记录失败：{msg}")
 
-                else:  # 转池
-                    src_grouped = {k: v for k, v in grouped.items() if k in TRANSFER_PATH_RULES}
-                    if not src_grouped:
-                        st.error("❌ 无可用的转出池类型")
-                    else:
-                        from_pond_id = pond_selector("源池塘（转出）", pond_id_to_info, src_grouped, "transfer_src")
-                        live_info = pond_id_to_info[from_pond_id]
-                        allowed = TRANSFER_PATH_RULES.get(live_info["pond_type"], [])
-                        tgt_grouped = {k: v for k, v in grouped.items() if k in allowed and v}
-                        if not tgt_grouped:
-                            st.error("❌ 无合法目标池")
+        # ========== 转池 / 外购 / 孵化 ==========
+        else:
+            from_pond_id = None
+            to_pond_id   = None
+            purchase_price = None
+            default_qty = 1000
+
+            if operation == "外购":
+                st.markdown("#### 从采购库存分配蛙苗到池塘")
+                frog_types_with_qty = get_frog_purchase_types_with_qty()
+                available_frogs = [f for f in frog_types_with_qty if f[3] > 0]
+
+                if not available_frogs:
+                    st.info("暂无可分配的蛙苗库存。请先在「采购类型」Tab 中添加蛙型并设置数量。")
+                    # ✅ 不要 st.stop()！直接结束本操作逻辑
+                else:
+                    # 构建选项
+                    frog_options = {f[0]: f"{f[1]}（单价 ¥{f[2]}/只，库存 {f[3]} 只）" for f in available_frogs}
+                    frog_id = st.selectbox("选择蛙型", options=list(frog_options.keys()),
+                                          format_func=lambda x: frog_options[x], key="allocate_frog_type")
+
+                    selected_frog = next(f for f in available_frogs if f[0] == frog_id)
+                    max_qty = selected_frog[3]
+
+                    to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "allocate_pond")
+                    pick_qty = st.number_input("分配数量", min_value=1, max_value=max_qty, step=50, key="allocate_qty")
+                    pick_note = st.text_input("备注", value="外购入库分配", key="allocate_note")
+
+                    if st.button("✅ 执行分配", type="primary", key="allocate_submit"):
+                        current_user = st.session_state.user['username']
+                        success, msg = allocate_frog_purchase(frog_id, to_pond_id, pick_qty, pick_note, current_user)
+                        if success:
+                            st.success(f"✅ 分配成功：{pick_qty} 只 {selected_frog[1]} 已入池")
+                            st.rerun()
                         else:
-                            to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
-                            purchase_price = None
+                            st.error(f"❌ 分配失败：{msg}")
 
-                # ========== 公共输入 & 提交 ==========
-                if to_pond_id is not None:
-                    # 动态设置数量默认值
-                    if operation == "孵化":
-                        quantity = st.number_input("数量", min_value=1, value=default_qty, step=50)
-                    elif operation == "外购":
-                        quantity = st.number_input("数量", min_value=1, value=1000, step=50)
-                    else:  # 转池
-                        quantity = st.number_input("数量", min_value=1, value=500, step=50)
+            # ---------------- 孵化 ----------------
+            elif operation == "孵化":
+                hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
+                if not hatch_grouped:
+                    st.error("❌ 请先至少创建一个‘孵化池’")
+                else:
+                    to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
 
-                    quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"], key="quick_desc")
-                    description = st.text_input("操作描述", value=quick_desc, placeholder="如：产卵转出 / 外购幼蛙 / 自孵蝌蚪")
+                    # ========== 新增：多选来源种蛙池 ==========
+                    # 获取所有“种蛙池”且数量 > 0 的池塘
+                    breeding_ponds = [
+                        (pid, info["name"])
+                        for pid, info in pond_id_to_info.items()
+                        if info["pond_type"] == "种蛙池" and info["current_count"] > 0
+                    ]
+                    source_breeding_ids = []
+                    if breeding_ponds:
+                        st.markdown("#### 🐸 选择亲本来源（种蛙池，可多选）")
+                        source_breeding_ids = st.multiselect(
+                            "来源种蛙池",
+                            options=[p[0] for p in breeding_ponds],
+                            format_func=lambda x: next(p[1] for p in breeding_ponds if p[0] == x),
+                            key="hatch_source_ponds"
+                        )
+                        if not source_breeding_ids:
+                            st.info("未选择来源种蛙池（可选）")
+                    else:
+                        st.info("暂无可用的种蛙池（需类型为“种蛙池”且数量 > 0）")
 
-                    if st.button(f"✅ 执行{operation}", type="primary", key="execute_operation_btn"):
-                        # 容量检查
-                        to_pond = get_pond_by_id(to_pond_id)
-                        if to_pond[4] + quantity > to_pond[3]:
-                            st.error(f"❌ 目标池「{to_pond[1]}」容量不足！当前 {to_pond[4]}/{to_pond[3]}，无法容纳 {quantity} 只。")
-                            st.stop()
-                        # 转池专属检查
-                        if operation == "转池" and from_pond_id is not None:
-                            from_pond = get_pond_by_id(from_pond_id)
-                            if from_pond[4] < quantity:
-                                st.error(f"❌ 源池「{from_pond[1]}」数量不足！当前只有 {from_pond[4]} 只。")
-                                st.stop()
-                        # 执行操作
-                        movement_type = {'转池': 'transfer', '外购': 'purchase', '孵化': 'hatch'}[operation]
+                    # ========== 原有孵化输入 ==========
+                    plate_input = st.text_input(
+                        "🥚 按板输入（1板 = 500只，如：1、1/2、2/3）",
+                        placeholder="留空则手动输入数量",
+                        key="hatch_plate"
+                    )
+                    if plate_input.strip():
+                        try:
+                            if '/' in plate_input:
+                                num, den = plate_input.split('/')
+                                plate_val = float(num) / float(den)
+                            else:
+                                plate_val = float(plate_input)
+                            default_qty = max(1, int(round(plate_val * 500)))
+                        except Exception:
+                            st.warning(f"板数格式无效：{plate_input}，已改用默认值 1000")
+                            default_qty = 1000
+
+                    quantity = st.number_input("数量", min_value=1, value=default_qty, step=50,
+                                            key="hatch_qty")
+                    quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"],
+                                            key="hatch_desc")
+                    base_description = st.text_input("操作描述", value=quick_desc or "自孵蝌蚪",
+                                            key="hatch_note")
+
+                    # 合并描述：加入来源信息
+                    full_description = base_description
+                    if source_breeding_ids:
+                        pond_names = [next(p[1] for p in breeding_ponds if p[0] == pid) for pid in source_breeding_ids]
+                        full_description += f" | 来源种蛙池: {', '.join(pond_names)}"
+
+                    if st.button("✅ 执行孵化", type="primary", key="hatch_submit"):
+                        current_user = st.session_state.user['username']
                         success, hint = add_stock_movement(
-                            movement_type=movement_type,
-                            from_pond_id=from_pond_id,
+                            movement_type='hatch',
+                            from_pond_id=None,
                             to_pond_id=to_pond_id,
                             quantity=quantity,
-                            description=description or f"{operation} {quantity} 只",
-                            unit_price=purchase_price
+                            description=full_description,
+                            unit_price=None,
+                            created_by=current_user
                         )
                         if success:
-                            st.success(f"✅ {operation}成功！")
+                            st.success(f"✅ 孵化成功：{quantity} 只")
                             st.rerun()
                         else:
                             st.error(hint)
-
-            # ========== 最近库存变动记录（分页）==========
-            st.markdown("---")
-            st.subheader("📋 最近库存变动记录（转池 / 外购 / 孵化 / 死亡 / 销售）")
-
-            page_size = 20
-            if "movement_page" not in st.session_state:
-                st.session_state.movement_page = 0
-
-            col_prev, col_next, col_info = st.columns([1, 1, 3])
-            current_page = st.session_state.movement_page
-            current_page = max(0, current_page)
-
-            with col_prev:
-                if st.button("⬅️ 上一页", disabled=(current_page == 0), key="movement_prev"):
-                    st.session_state.movement_page -= 1
-                    st.rerun()
-            with col_next:
-                if st.button("下一页 ➡️", key="movement_next"):
-                    st.session_state.movement_page += 1
-                    st.rerun()
-            with col_info:
-                st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
-
-            offset = current_page * page_size
-
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT sm.id,
-                    CASE sm.movement_type
-                        WHEN 'transfer' THEN '转池'
-                        WHEN 'purchase' THEN '外购'
-                        WHEN 'hatch'    THEN '孵化'
-                        WHEN 'sale'     THEN '销售出库'
-                        WHEN 'death'    THEN '死亡'
-                    END AS movement_type,
-                    fp.name   AS from_name,
-                    tp.name   AS to_name,
-                    sm.quantity,
-                    sm.description,
-                    sm.moved_at
-                FROM stock_movement_shiwa sm
-                LEFT JOIN pond_shiwa fp ON sm.from_pond_id = fp.id
-                LEFT JOIN pond_shiwa tp ON sm.to_pond_id = tp.id
-                ORDER BY sm.moved_at DESC
-                LIMIT %s OFFSET %s;
-            """, (page_size, offset))
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-
-            if rows:
-                df_log = pd.DataFrame(rows, columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间"])
-                st.dataframe(df_log, use_container_width=True, hide_index=True)
-
-                csv = df_log.to_csv(index=False)
-                st.download_button(
-                    label="📥 导出当前页 CSV",
-                    data=csv,
-                    file_name=f"movement_page_{current_page + 1}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
-                )
-
-                if len(rows) == page_size:
-                    st.info("✅ 还有更多记录，请点击「下一页」查看")
+            # ---------------- 转池 ----------------
+            else:  # 转池
+                src_grouped = {k: v for k, v in grouped.items() if k in TRANSFER_PATH_RULES}
+                if not src_grouped:
+                    st.error("❌ 无可用的转出池类型")
                 else:
-                    st.success("已到最后一页")
-            else:
-                if current_page == 0:
-                    st.info("暂无操作记录")
-                else:
-                    st.warning("没有更多数据了")
-                    st.session_state.movement_page -= 1
+                    from_pond_id = pond_selector("源池塘（转出）", pond_id_to_info, src_grouped, "transfer_src")
+                    live_info = pond_id_to_info[from_pond_id]
+                    allowed = TRANSFER_PATH_RULES.get(live_info["pond_type"], [])
+                    tgt_grouped = {k: v for k, v in grouped.items() if k in allowed and v}
+                    if not tgt_grouped:
+                        st.error("❌ 无合法目标池")
+                    else:
+                        to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
 
-            # ========== 最近死亡记录（独立区块）==========
-            st.markdown("---")
-            st.subheader("💀 最近死亡记录")
+                        quantity = st.number_input("数量", min_value=1, value=500, step=50,
+                                                key="transfer_qty")
+                        quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"],
+                                                key="transfer_desc")
+                        description = st.text_input("操作描述", value=quick_desc or "日常转池",
+                                                key="transfer_note")
 
-            page_size_death = 20
-            if "death_page" not in st.session_state:
-                st.session_state.death_page = 0
+                        if st.button("✅ 执行转池", type="primary", key="transfer_submit"):
+                            current_user = st.session_state.user['username']
+                            # 容量 & 数量检查
+                            to_pond = get_pond_by_id(to_pond_id)
+                            if to_pond[4] + quantity > to_pond[3]:
+                                st.error(f"❌ 目标池容量不足！")
+                                st.stop()
+                            from_pond = get_pond_by_id(from_pond_id)
+                            if from_pond[4] < quantity:
+                                st.error(f"❌ 源池数量不足！")
+                                st.stop()
+                            success, hint = add_stock_movement(
+                                movement_type='transfer',
+                                from_pond_id=from_pond_id,
+                                to_pond_id=to_pond_id,
+                                quantity=quantity,
+                                description=description,
+                                unit_price=None,
+                                created_by=current_user
+                            )
+                            if success:
+                                st.success(f"✅ 转池成功")
+                                st.rerun()
+                            else:
+                                st.error(hint)
 
-            col_prev_d, col_next_d, col_info_d = st.columns([1, 1, 3])
-            current_page_d = max(0, st.session_state.death_page)
+        # ========== 最近库存变动记录（分页）==========
+        st.markdown("---")
+        st.subheader("📋 最近库存变动记录（转池 / 外购 / 孵化 / 死亡 / 销售）")
+        page_size = 20
+        if "movement_page" not in st.session_state:
+            st.session_state.movement_page = 0
+        col_prev, col_next, col_info = st.columns([1, 1, 3])
+        current_page = max(0, st.session_state.movement_page)
+        with col_prev:
+            if st.button("⬅️ 上一页", disabled=(current_page == 0), key="movement_prev"):
+                st.session_state.movement_page -= 1
+                st.rerun()
+        with col_next:
+            if st.button("下一页 ➡️", key="movement_next"):
+                st.session_state.movement_page += 1
+                st.rerun()
+        with col_info:
+            st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
 
-            with col_prev_d:
-                if st.button("⬅️ 上一页", disabled=(current_page_d == 0), key="death_prev"):
-                    st.session_state.death_page -= 1
-                    st.rerun()
-            with col_next_d:
-                if st.button("下一页 ➡️", key="death_next"):
-                    st.session_state.death_page += 1
-                    st.rerun()
-            with col_info_d:
-                st.caption(f"第 {current_page_d + 1} 页（每页 {page_size_death} 条）")
-
-            offset_d = current_page_d * page_size_death
-
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            # ① 先抓本页死亡记录
-            cur.execute("""
-                SELECT sm.id,
-                    p.name AS pond_name,
-                    sm.quantity,
-                    sm.description,
-                    sm.moved_at
-                FROM stock_movement_shiwa sm
-                JOIN pond_shiwa p ON sm.from_pond_id = p.id
-                WHERE sm.movement_type = 'death'
-                ORDER BY sm.moved_at DESC
-                LIMIT %s OFFSET %s;
-            """, (page_size_death, offset_d))
-            death_rows = cur.fetchall()
-
-            # ② 一次性抓出这些记录对应的所有图片
-            death_ids = [r[0] for r in death_rows]
-            img_dict = defaultdict(list)  # key: death_movement_id, value: [path1, path2, ...]
-
-            if death_ids:
-                cur.execute("""
-                    SELECT death_movement_id, image_path
-                    FROM death_image_shiwa
-                    WHERE death_movement_id = ANY(%s);
-                """, (death_ids,))
-                for mid, path in cur.fetchall():
-                    img_dict[mid].append(path)
-
-            cur.close()
-            conn.close()
-
-            # ③ 展示
-            if death_rows:
-                for mid, pond, qty, desc, moved_at in death_rows:
-                    with st.expander(f"🪦 {pond} · {qty} 只 · {moved_at.strftime('%Y-%m-%d %H:%M')}"):
-                        st.write(f"**描述**：{desc}")
-
-                        imgs = img_dict.get(mid, [])
-                        if imgs:
-                            st.markdown("**现场照片：**")
-                            # 每行 3 张图
-                            cols_per_row = 3
-                            for i in range(0, len(imgs), cols_per_row):
-                                cols = st.columns(cols_per_row)
-                                for j, img_path in enumerate(imgs[i:i+cols_per_row]):
-                                    if os.path.exists(img_path):
-                                        with cols[j]:
-                                            st.image(img_path, caption=f"照片 {i+j+1}", use_container_width=True)
-                                    else:
-                                        with cols[j]:
-                                            st.caption(f"照片 {i+j+1} 不存在")
-                        else:
-                            st.caption("🖼️ 无照片")
-
-                if len(death_rows) == page_size_death:
-                    st.info("✅ 还有更多死亡记录，请点击「下一页」查看")
-                else:
-                    st.success("已到最后一页")
-            else:
-                if current_page_d == 0:
-                    st.info("暂无死亡记录")
-                else:
-                    st.warning("没有更多数据了")
-                    st.session_state.death_page -= 1
-                        # ----------------------------- Tab 5: 饲料类型 ---------------------------
-    with tab5:
-        st.subheader("🪱 饲料类型管理")
+        offset = current_page * page_size
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute("""
+            SELECT sm.id,
+                CASE sm.movement_type
+                    WHEN 'transfer' THEN '转池'
+                    WHEN 'purchase' THEN '外购'
+                    WHEN 'hatch'    THEN '孵化'
+                    WHEN 'sale'     THEN '销售出库'
+                    WHEN 'death'    THEN '死亡'
+                END AS movement_type,
+                fp.name   AS from_name,
+                tp.name   AS to_name,
+                sm.quantity,
+                sm.description,
+                sm.moved_at,
+                sm.created_by AS 操作人
+            FROM stock_movement_shiwa sm
+            LEFT JOIN pond_shiwa fp ON sm.from_pond_id = fp.id
+            LEFT JOIN pond_shiwa tp ON sm.to_pond_id = tp.id
+            ORDER BY sm.moved_at DESC
+            LIMIT %s OFFSET %s;
+        """, (page_size, offset))
+        rows = cur.fetchall()
+        cur.close(); conn.close()
 
-        # 1. 已有列表
-        cur.execute("SELECT id, name, unit_price FROM feed_type_shiwa ORDER BY id;")
-        feed_rows = cur.fetchall()
-        if feed_rows:
-            df_feed = pd.DataFrame(feed_rows, columns=["ID", "名称", "单价(¥/kg)"])
-            st.dataframe(df_feed, use_container_width=True, hide_index=True)
+        if rows:
+            df_log = pd.DataFrame(rows, columns=["ID", "类型", "源池", "目标池", "数量", "描述", "时间", "操作人"])
+            st.dataframe(df_log, use_container_width=True, hide_index=True)
+            csv = df_log.to_csv(index=False)
+            st.download_button(label="📥 导出当前页 CSV", data=csv,
+                            file_name=f"movement_page_{current_page + 1}_{pd.Timestamp.now():%Y%m%d_%H%M%S}.csv",
+                            mime="text/csv")
+            if len(rows) == page_size:
+                st.info("✅ 还有更多记录，请点击「下一页」查看")
+            else:
+                st.success("已到最后一页")
         else:
-            st.info("暂无饲料类型，请添加。")
+            if current_page == 0:
+                st.info("暂无操作记录")
+            else:
+                st.warning("没有更多数据了")
+                st.session_state.movement_page -= 1
 
-        # 2. 新增/修改
-        with st.form("feed_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                name = st.text_input("饲料名称", placeholder="如：红虫")
-            with c2:
-                price = st.number_input("单价 (¥/kg)", min_value=0.0, step=1.0, value=20.0)
-            submitted = st.form_submit_button("✅ 添加/更新")
-            if submitted:
-                # 若同名则 ON CONFLICT 更新单价
-                cur.execute("""
-                    INSERT INTO feed_type_shiwa (name, unit_price)
-                    VALUES (%s, %s)
-                    ON CONFLICT (name)
-                    DO UPDATE SET unit_price = EXCLUDED.unit_price;
-                """, (name, price))
-                conn.commit()
-                st.success(f"✅ 饲料「{name}」已保存！")
+        # ========== 最近死亡记录（独立区块）==========
+        st.markdown("---")
+        st.subheader("💀 最近死亡记录")
+        page_size_death = 20
+        if "death_page" not in st.session_state:
+            st.session_state.death_page = 0
+        col_prev_d, col_next_d, col_info_d = st.columns([1, 1, 3])
+        current_page_d = max(0, st.session_state.death_page)
+        with col_prev_d:
+            if st.button("⬅️ 上一页", disabled=(current_page_d == 0), key="death_prev"):
+                st.session_state.death_page -= 1
+                st.rerun()
+        with col_next_d:
+            if st.button("下一页 ➡️", key="death_next"):
+                st.session_state.death_page += 1
+                st.rerun()
+        with col_info_d:
+            st.caption(f"第 {current_page_d + 1} 页（每页 {page_size_death} 条）")
+
+        offset_d = current_page_d * page_size_death
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sm.id,
+                p.name AS pond_name,
+                sm.quantity,
+                sm.description,
+                sm.moved_at,
+                sm.created_by AS 操作人
+            FROM stock_movement_shiwa sm
+            JOIN pond_shiwa p ON sm.from_pond_id = p.id
+            LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
+            WHERE sm.movement_type = 'death'
+            ORDER BY sm.moved_at DESC
+            LIMIT %s OFFSET %s;
+        """, (page_size_death, offset_d))
+        death_rows = cur.fetchall()
+        death_ids = [r[0] for r in death_rows]
+        img_dict = defaultdict(list)
+        if death_ids:
+            cur.execute("SELECT death_movement_id, image_path FROM death_image_shiwa WHERE death_movement_id = ANY(%s);", (death_ids,))
+            for mid, path in cur.fetchall():
+                img_dict[mid].append(path)
+        cur.close(); conn.close()
+
+        if death_rows:
+            for mid, pond, qty, desc, moved_at, operator in death_rows:
+                with st.expander(f"🪦 {pond} · {qty} 只 · {moved_at:%Y-%m-%d %H:%M} · 操作人：{operator}"):
+                    st.write(f"**描述**：{desc}")
+                    imgs = img_dict.get(mid, [])
+                    if imgs:
+                        st.markdown("**现场照片：**")
+                        cols_per_row = 3
+                        for i in range(0, len(imgs), cols_per_row):
+                            cols = st.columns(cols_per_row)
+                            for j, img_path in enumerate(imgs[i:i+cols_per_row]):
+                                if os.path.exists(img_path):
+                                    with cols[j]:
+                                        st.image(img_path, caption=f"照片 {i+j+1}", use_container_width=True)
+                                else:
+                                    with cols[j]:
+                                        st.caption(f"照片 {i+j+1} 不存在")
+                    else:
+                        st.caption("🖼️ 无照片")
+            if len(death_rows) == page_size_death:
+                st.info("✅ 还有更多死亡记录，请点击「下一页」查看")
+            else:
+                st.success("已到最后一页")
+        else:
+            if current_page_d == 0:
+                st.info("暂无死亡记录")
+            else:
+                st.warning("没有更多数据了")
+                st.session_state.death_page -= 1
+    with tab5:
+        st.subheader("🛒 采购类型管理（含供应商 & 月度汇总）")
+
+        current_user = st.session_state.user["username"]  # 当前登录用户
+
+        # ===== 1. 饲料类型（带库存+供应商） =====
+        st.markdown("#### 1. 饲料类型")
+        def get_feed_types_with_stock():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, name, unit_price, COALESCE(stock_kg,0),
+                    supplier, supplier_phone, purchased_by
+                FROM feed_type_shiwa
+                ORDER BY id;
+            """)
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return rows
+        def add_feed_type_with_stock(name, price, stock_kg, supplier, phone, by):
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO feed_type_shiwa (name, unit_price, stock_kg,
+                                            supplier, supplier_phone, purchased_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE
+                SET unit_price = EXCLUDED.unit_price,
+                    stock_kg   = EXCLUDED.stock_kg,
+                    supplier   = EXCLUDED.supplier,
+                    supplier_phone = EXCLUDED.supplier_phone,
+                    purchased_by   = EXCLUDED.purchased_by;
+            """, (name, price, stock_kg, supplier, phone, by))
+            conn.commit(); cur.close(); conn.close()
+
+        feed_types = get_feed_types_with_stock()
+        if feed_types:
+            df_f = pd.DataFrame(feed_types,
+                                columns=["ID", "名称", "单价(¥/kg)", "库存(kg)",
+                                        "供应商", "联系方式", "采购人"])
+            st.dataframe(df_f, use_container_width=True, hide_index=True)
+
+        with st.form("feed_type_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1: fname = st.text_input("饲料名称")
+            with c2: fprice = st.number_input("单价 (¥/kg)", min_value=0.0, step=1.0, value=20.0)
+            with c3: fstock = st.number_input("库存 (kg)", min_value=0.0, step=1.0, value=0.0)
+            c4, c5 = st.columns(2)
+            with c4: fsupp = st.text_input("供应商", placeholder="如 XX 饲料厂")
+            with c5: fphone = st.text_input("联系方式", placeholder="手机/固话")
+            # 采购人默认当前用户，只读
+            st.text_input("采购人", value=current_user, disabled=True)
+            if st.form_submit_button("✅ 添加/更新饲料"):
+                add_feed_type_with_stock(fname, fprice, fstock, fsupp, fphone, current_user)
+                st.success(f"饲料「{fname}」已保存")
                 st.rerun()
 
-        # 3. 删除
-        if feed_rows:
-            with st.form("del_feed"):
-                to_del = st.selectbox("删除饲料",
-                                    options=[r[0] for r in feed_rows],
-                                    format_func=lambda x:
-                                    next(r[1] for r in feed_rows if r[0] == x))
-                if st.form_submit_button("🗑️ 删除", type="secondary"):
-                    cur.execute("DELETE FROM feed_type_shiwa WHERE id = %s;", (to_del,))
-                    conn.commit()
-                    st.success("已删除！")
-                    st.rerun()
-        cur.close()
+        # ===== 2. 蛙型 / 苗种（同套路） =====
+        st.markdown("#### 2. 蛙型 / 苗种")
+        def get_frog_purchase_types_with_supplier():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, name, unit_price, COALESCE(quantity,0),
+                    supplier, supplier_phone, purchased_by
+                FROM frog_purchase_type_shiwa
+                ORDER BY id;
+            """)
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return rows
+        def add_frog_type_with_supplier(name, price, qty, supplier, phone, by):
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO frog_purchase_type_shiwa
+                (name, unit_price, quantity, supplier, supplier_phone, purchased_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE
+                SET unit_price = EXCLUDED.unit_price,
+                    quantity   = EXCLUDED.quantity,
+                    supplier   = EXCLUDED.supplier,
+                    supplier_phone = EXCLUDED.supplier_phone,
+                    purchased_by   = EXCLUDED.purchased_by;
+            """, (name, price, qty, supplier, phone, by))
+            conn.commit(); cur.close(); conn.close()
+
+        frog_types = get_frog_purchase_types_with_supplier()
+        if frog_types:
+            df_t = pd.DataFrame(frog_types,
+                                columns=["ID", "名称", "单价(¥/只)", "数量(只)",
+                                        "供应商", "联系方式", "采购人"])
+            st.dataframe(df_t, use_container_width=True, hide_index=True)
+
+        with st.form("frog_type_form"):
+            c1, c2, c3 = st.columns(3)
+            with c1: tname = st.text_input("蛙型名称")
+            with c2: tprice = st.number_input("单价 (¥/只)", min_value=0.1, step=1.0, value=20.0)
+            with c3: tqty = st.number_input("数量 (只)", min_value=0, step=50, value=0)
+            c4, c5 = st.columns(2)
+            with c4: tsupp = st.text_input("供应商", placeholder="如 XX 养殖场")
+            with c5: tphone = st.text_input("联系方式", placeholder="手机/微信")
+            st.text_input("采购人", value=current_user, disabled=True)
+            if st.form_submit_button("✅ 添加/更新蛙型"):
+                add_frog_type_with_supplier(tname, tprice, tqty, tsupp, tphone, current_user)
+                st.success(f"蛙型「{tname}」已保存")
+                st.rerun()
+
+        # ===== 3. 月度采购汇总 =====
+        st.markdown("---")
+        st.subheader("📊 月度采购汇总（饲料+蛙型）")
+        conn = get_db_connection()
+        # 饲料按月
+        # 饲料
+        feed_month = pd.read_sql("""
+            SELECT date_trunc('month', created_at) AS 月份,
+                SUM(stock_kg)                   AS 采购量_kg,
+                SUM(stock_kg * unit_price)      AS 采购金额_元
+            FROM feed_type_shiwa
+            WHERE stock_kg > 0
+            GROUP BY 月份
+            ORDER BY 月份 DESC;
+        """, conn)
+
+        # 蛙型
+        frog_month = pd.read_sql("""
+            SELECT date_trunc('month', created_at) AS 月份,
+                SUM(quantity)                   AS 采购量_只,
+                SUM(quantity * unit_price)      AS 采购金额_元
+            FROM frog_purchase_type_shiwa
+            WHERE quantity > 0
+            GROUP BY 月份
+            ORDER BY 月份 DESC;
+        """, conn)
         conn.close()
 
-    # Tab 6: 销售记录（优化版）
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("饲料采购")
+            if not feed_month.empty:
+                feed_month["月份"] = feed_month["月份"].dt.strftime("%Y-%m")
+                st.dataframe(feed_month.style.format({"采购量_kg": "{:.2f}", "采购金额_元": "¥{:,.2f}"}),
+                            use_container_width=True, hide_index=True)
+                csv1 = feed_month.to_csv(index=False)
+                st.download_button("📥 导出饲料月度CSV", csv1,
+                                file_name=f"feed_month_{pd.Timestamp.now():%Y%m}.csv")
+            else:
+                st.info("暂无饲料采购记录")
+
+        with col2:
+            st.caption("蛙型采购")
+            if not frog_month.empty:
+                frog_month["月份"] = frog_month["月份"].dt.strftime("%Y-%m")
+                st.dataframe(frog_month.style.format({"采购量_只": "{:.0f}", "采购金额_元": "¥{:,.2f}"}),
+                            use_container_width=True, hide_index=True)
+                csv2 = frog_month.to_csv(index=False)
+                st.download_button("📥 导出蛙型月度CSV", csv2,
+                                file_name=f"frog_month_{pd.Timestamp.now():%Y%m}.csv")
+            else:
+                st.info("暂无蛙型采购记录")
+    # Tab 6: 销售记录（按斤销售，保留原始斤数）
     # -----------------------------
     with tab6:
-        st.subheader("💰 销售记录")
+        st.subheader("💰 销售记录（按斤计算，1只 ≈ 4斤）")
         ponds = get_all_ponds()
         if not ponds:
             st.warning("暂无可销售池塘")
-            st.stop()
-
-        # ✅ 仅允许销售的池类型
-        SALEABLE_POND_TYPES = ["商品蛙池", "三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池","种蛙池"]
-        cand = [p for p in ponds if p[2] in SALEABLE_POND_TYPES and p[5] > 0]
-
-        if not cand:
-            st.info("没有可销售的蛙（仅显示：商品蛙池、三年~六年蛙池）")
-            st.stop()
-
-        # ========================
-        # ✅ 优化：用表格式单选替代下拉
-        # ========================
-        st.markdown("#### 📋 待销售池塘清单（点击选择）")
-        
-        # 构建选项列表：每个选项是一个清晰字符串
-        pond_options = []
-        pond_id_list = []
-        for p in cand:
-            pid, name, pond_type, frog_type, max_cap, current = p
-            # 格式：[细皮蛙] 商品蛙池001（商品蛙池｜现存 1200 只）
-            label = f"[{frog_type}] {name}（{pond_type}｜现存 {current} 只）"
-            pond_options.append(label)
-            pond_id_list.append(pid)
-
-        # 使用 session_state 记住上次选择
-        if "selected_sale_pond_id" not in st.session_state:
-            st.session_state.selected_sale_pond_id = pond_id_list[0]
-
-        # 用 st.radio 模拟“清晰列表”，垂直排列
-        selected_label = st.radio(
-            "选择要销售的池塘",
-            options=pond_options,
-            index=pond_id_list.index(st.session_state.selected_sale_pond_id),
-            key="sale_pond_radio"
-        )
-
-        # 反查选中的 pond_id
-        selected_pond_id = pond_id_list[pond_options.index(selected_label)]
-        st.session_state.selected_sale_pond_id = selected_pond_id
-
-        # 显示选中池详情（可选）
-        info = next(p for p in cand if p[0] == selected_pond_id)
-        st.info(f"✅ 已选：{info[1]}｜类型：{info[2]}｜蛙种：{info[3]}｜库存：{info[5]} 只")
-
-        st.markdown("---")
-
-        # ---- 客户区 ----
-        st.markdown("#### 1. 选择客户")
-        customers = get_customers() or []
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            cust_opt = ["新建客户"] + [f"{c[1]} ({c[3]})" for c in customers]
-            cust_sel = st.selectbox("客户", cust_opt, key="sale_customer")
-        new_cust = cust_sel == "新建客户"
-        with c2:
-            sale_type = st.radio("销售类型", ["零售", "批发"], horizontal=True, key="sale_type")
-
-        customer_id = None
-
-        if new_cust:
-            with st.form("new_customer"):
-                name = st.text_input("客户姓名")
-                phone = st.text_input("电话", max_chars=20)
-                if st.form_submit_button("添加客户"):
-                    if not name.strip():
-                        st.error("请输入姓名")
-                        # ✅ 不用 st.stop()，表单提交失败就停在这里
-                    else:
-                        customer_id = add_customer(name.strip(), phone, sale_type)
-                        st.success(f"✅ 客户 {name} 已创建")
-                        st.rerun()  # 重新加载以显示新客户
+            # 不 stop，继续渲染历史记录
         else:
-            if customers:
-                customer_id = customers[cust_opt.index(cust_sel) - 1][0]
-            # else: customer_id 保持 None
+            SALEABLE_POND_TYPES = ["商品蛙池", "三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "种蛙池"]
+            cand = [p for p in ponds if p[2] in SALEABLE_POND_TYPES and p[5] > 0]
+            if not cand:
+                st.info("没有可销售的蛙（仅显示：商品蛙池、三年~六年蛙池）")
+                # 不 stop，继续渲染历史记录
+            else:
+                # ========== 池塘选择 ==========
+                st.markdown("#### 📋 待销售池塘清单（点击选择）")
+                pond_options = []
+                pond_id_list = []
+                for p in cand:
+                    pid, name, pond_type, frog_type, max_cap, current = p
+                    label = f"[{frog_type}] {name}（{pond_type}｜现存 {current} 只 ≈ {current * 4} 斤）"
+                    pond_options.append(label)
+                    pond_id_list.append(pid)
 
-        # ✅ 统一判断：是否有有效客户 ID
-        if customer_id is None:
-            st.info("请选择现有客户或创建新客户以继续")
-            # 不渲染销售表单和客户信息
-        else:
-            # --- 显示客户信息（简洁版）---
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT name, phone, type FROM customer_shiwa WHERE id = %s;", (customer_id,))
-            cust_detail = cur.fetchone()
-            cur.close()
-            conn.close()
-            
-            if cust_detail:
-                name, phone, ctype = cust_detail
-                phone_str = f"｜电话：{phone}" if phone else ""
-                st.info(f"已选客户：{name}（{ctype}）{phone_str}")
-            
-            # --- 销售表单将在后面渲染 ---
+                if "selected_sale_pond_id" not in st.session_state:
+                    st.session_state.selected_sale_pond_id = pond_id_list[0]
 
-        # ✅ 新增：简洁显示客户信息（仿照池塘快速预览）
-        # 获取客户详情
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT name, phone, type FROM customer_shiwa WHERE id = %s;", (customer_id,))
-        cust_detail = cur.fetchone()
-        cur.close()
-        conn.close()
+                selected_label = st.radio(
+                    "选择要销售的池塘",
+                    options=pond_options,
+                    index=pond_id_list.index(st.session_state.selected_sale_pond_id),
+                    key="sale_pond_radio"
+                )
+                selected_pond_id = pond_id_list[pond_options.index(selected_label)]
+                st.session_state.selected_sale_pond_id = selected_pond_id
 
-        if cust_detail:
-            name, phone, ctype = cust_detail
-            phone_str = f"｜电话：{phone}" if phone else ""
-            st.info(f"已选客户：{name}（{ctype}）{phone_str}")
+                info = next(p for p in cand if p[0] == selected_pond_id)
+                st.info(f"✅ 已选：{info[1]}｜类型：{info[2]}｜蛙种：{info[3]}｜库存：{info[5]} 只（≈ {info[5] * 4} 斤）")
+                st.markdown("---")
 
-                # ---- 销售表单 ----
-        st.markdown("#### 2. 销售明细")
-        with st.form("sale_form"):
-            # 安全 format_func
-            def pond_label(pid):
-                for c in cand:
-                    if c[0] == pid:
-                        return f"{c[1]}  ({c[2]}-{c[3]}  现存{c[5]})"
-                return "未知池"
+                # ========== 客户选择 ==========
+                st.markdown("#### 1. 选择客户")
+                customers = get_customers() or []
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    cust_opt = ["新建客户"] + [f"{c[1]} ({c[3]})" for c in customers]
+                    cust_sel = st.selectbox("客户", cust_opt, key="sale_customer")
+                new_cust = cust_sel == "新建客户"
+                with c2:
+                    sale_type = st.radio("销售类型", ["零售", "批发"], horizontal=True, key="sale_type")
 
-            # ✅ 直接使用 session_state 中保存的 pond_id
-            selected_pid = st.session_state.selected_sale_pond_id
-            all_pids = [c[0] for c in cand]
-            default_index = all_pids.index(selected_pid) if selected_pid in all_pids else 0
+                customer_id = None
+                if new_cust:
+                    with st.form("new_customer"):
+                        name = st.text_input("客户姓名")
+                        phone = st.text_input("电话", max_chars=20)
+                        if st.form_submit_button("添加客户"):
+                            if not name.strip():
+                                st.error("请输入姓名")
+                            else:
+                                customer_id = add_customer(name.strip(), phone, sale_type)
+                                st.success(f"✅ 客户 {name} 已创建")
+                                st.rerun()
+                else:
+                    if customers:
+                        customer_id = customers[cust_opt.index(cust_sel) - 1][0]
 
-            pond_id = st.selectbox(
-                "选择池塘",
-                options=all_pids,
-                format_func=pond_label,
-                index=default_index,
-                key="sale_pond"
-            )
-            pond_info = next(c for c in cand if c[0] == pond_id)
-            max_q = pond_info[5]
-            qty = st.number_input("销售数量", min_value=1, max_value=max_q, step=1)
-            default_price = 60.0 if sale_type == "零售" else 45.0
-            price = st.number_input("单价 (元/只)", min_value=0.1, value=default_price, step=5.0)
-            note = st.text_area("备注")
-            if st.form_submit_button("✅ 确认销售", type="primary"):
-                do_sale(pond_id, customer_id, sale_type, qty, price, note)
-                st.success(f"✅ 销售成功：{qty} 只 × {price} = {qty*price:.2f} 元")
-                st.rerun()
+                # ========== 仅当客户有效时，才显示销售表单 ==========
+                if customer_id is None:
+                    st.info("请选择或创建客户后再进行销售操作")
+                else:
+                    # 显示客户信息
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT name, phone, type FROM customer_shiwa WHERE id = %s;", (customer_id,))
+                    cust_detail = cur.fetchone()
+                    cur.close()
+                    conn.close()
+                    if cust_detail:
+                        name, phone, ctype = cust_detail
+                        phone_str = f"｜电话：{phone}" if phone else ""
+                        st.info(f"已选客户：{name}（{ctype}）{phone_str}")
 
-        # ---- 最近销售记录（分页）----
+                    # ========== 销售表单（按斤）==========
+                    st.markdown("#### 2. 销售明细（按斤计算，1只 ≈ 4斤）")
+                    with st.form("sale_form"):
+                        pond_id = st.session_state.selected_sale_pond_id
+                        pond_info = next(c for c in cand if c[0] == pond_id)
+                        max_zhi = pond_info[5]
+                        max_jin = max_zhi * 4.0
+
+                        weight_jin = st.number_input(
+                            "销售重量 (斤)",
+                            min_value=0.1,
+                            max_value=max_jin,
+                            step=1.0,
+                            value=min(40.0, max_jin)
+                        )
+
+                        # 四舍五入到整只（用于扣库存）
+                        quantity_zhi = round(weight_jin / 4.0)
+                        if quantity_zhi == 0:
+                            st.error("销售重量不足 2 斤（0.5 只），无法销售")
+                            st.form_submit_button("✅ 确认销售", disabled=True)
+                        elif quantity_zhi > max_zhi:
+                            st.error(f"❌ 超出库存！最多可售 {max_jin} 斤（{max_zhi} 只）")
+                            st.form_submit_button("✅ 确认销售", disabled=True)
+                        else:
+                            st.info(f"→ 将扣减库存：{quantity_zhi} 只（用户输入：{weight_jin} 斤）")
+                            default_price_per_jin = 15.0 if sale_type == "零售" else 11.25
+                            price_per_jin = st.number_input(
+                                "单价 (元/斤)",
+                                min_value=0.1,
+                                value=default_price_per_jin,
+                                step=0.5
+                            )
+                            note = st.text_area("备注")
+                            if st.form_submit_button("✅ 确认销售", type="primary"):
+                                current_user = st.session_state.user['username']
+                                # 调用修改后的 do_sale（传入原始斤数和只数）
+                                do_sale(
+                                    pond_id=pond_id,
+                                    customer_id=customer_id,
+                                    sale_type=sale_type,
+                                    qty_zhi=quantity_zhi,
+                                    unit_price_per_zhi=price_per_jin * 4,
+                                    weight_jin=weight_jin,
+                                    note=note,
+                                    sold_by=current_user
+                                )
+                                total_yuan = weight_jin * price_per_jin
+                                st.success(f"✅ 销售成功：{weight_jin} 斤 × {price_per_jin} 元/斤 = {total_yuan:.2f} 元")
+                                st.rerun()
+
+        # ========== 销售记录总览（始终显示）==========
         st.markdown("#### 3. 最近销售记录")
-
         page_size = 20
         if "sale_page" not in st.session_state:
             st.session_state.sale_page = 0
-
         col_prev, col_next, col_info = st.columns([1, 1, 3])
         current_page = st.session_state.sale_page
-
         with col_prev:
             if st.button("⬅️ 上一页", disabled=(current_page == 0), key="sale_prev"):
                 st.session_state.sale_page -= 1
@@ -2194,12 +2403,11 @@ def run():
             st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
 
         offset = current_page * page_size
-
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT sr.id, p.name pond, c.name customer, sr.sale_type, sr.quantity,
-                sr.unit_price, sr.total_amount, sr.sold_at, sr.note
+                sr.unit_price, sr.total_amount, sr.sold_at, sr.note, sr.weight_jin, sr.sold_by
             FROM sale_record_shiwa sr
             JOIN pond_shiwa p ON p.id = sr.pond_id
             JOIN customer_shiwa c ON c.id = sr.customer_id
@@ -2213,17 +2421,29 @@ def run():
         if rows:
             df = pd.DataFrame(
                 rows,
-                columns=["ID", "池塘", "客户", "类型", "数量", "单价", "总金额", "时间", "备注"]
+                columns=["ID", "池塘", "客户", "类型", "数量_只", "单价_元每只", "总金额", "时间", "备注", "原始斤数", "销售人"]
             )
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            # 兜底：如果 weight_jin 为 NULL（旧记录），用 quantity * 4
+            df["重量_斤"] = df["原始斤数"].fillna(df["数量_只"] * 4)
+            df["单价_元每斤"] = df["单价_元每只"] / 4
+            df_display = df[["池塘", "客户", "类型", "重量_斤", "单价_元每斤", "总金额", "销售人", "时间", "备注"]]
 
-            csv = df.to_csv(index=False)
+            st.dataframe(
+                df_display.style.format({
+                    "重量_斤": "{:.2f} 斤",
+                    "单价_元每斤": "¥{:.2f}/斤",
+                    "总金额": "¥{:.2f}"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            csv = df_display.to_csv(index=False)
             st.download_button(
                 "📥 导出当前页 CSV",
                 csv,
                 file_name=f"sale_page_{current_page + 1}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
             )
-
             if len(rows) == page_size:
                 st.info("✅ 还有更多记录，请点击「下一页」查看")
             else:
