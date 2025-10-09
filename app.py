@@ -554,29 +554,51 @@ def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_fil
     finally:
         cur.close()
         conn.close()
-def get_recent_death_records(limit=20):
+def get_recent_death_records(limit=20, offset=0):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
+    try:
+        # 1️⃣ 先查死亡记录（不 JOIN 图片）
+        cur.execute("""
             SELECT 
-        sm.id,
-        p.name AS pond_name,
-        sm.quantity,
-        sm.description,
-        sm.moved_at,
-        di.image_path,
-        sm.created_by AS 操作人
-    FROM stock_movement_shiwa sm
-    JOIN pond_shiwa p ON sm.from_pond_id = p.id
-    LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
-    WHERE sm.movement_type = 'death'
-    ORDER BY sm.moved_at DESC
-    LIMIT %s;
-    """, (limit,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+                sm.id,
+                p.name AS pond_name,
+                sm.quantity,
+                sm.description,
+                sm.moved_at,
+                sm.created_by AS 操作人
+            FROM stock_movement_shiwa sm
+            JOIN pond_shiwa p ON sm.from_pond_id = p.id
+            WHERE sm.movement_type = 'death'
+            ORDER BY sm.moved_at DESC
+            LIMIT %s OFFSET %s;
+        """, (limit, offset))
+        death_rows = cur.fetchall()  # [(id, pond, qty, desc, time, user), ...]
+        death_ids = [row[0] for row in death_rows]
+
+        # 2️⃣ 再查这些死亡记录对应的图片（批量查询）
+        image_dict = {}
+        if death_ids:
+            cur.execute("""
+                SELECT death_movement_id, image_path
+                FROM death_image_shiwa
+                WHERE death_movement_id = ANY(%s);
+            """, (death_ids,))
+            for mid, path in cur.fetchall():
+                if mid not in image_dict:
+                    image_dict[mid] = []
+                image_dict[mid].append(path)
+
+        # 3️⃣ 合并：每条死亡记录 + 其图片列表
+        result = []
+        for row in death_rows:
+            mid = row[0]
+            images = image_dict.get(mid, [])
+            result.append((mid, row[1], row[2], row[3], row[4], row[5], images))
+        return result
+    finally:
+        cur.close()
+        conn.close()
 def get_pond_type_id_by_name(name):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1757,7 +1779,7 @@ def run():
                         for p in ponds}
         grouped = group_ponds_by_type(pond_id_to_info)
 
-        # ========== 死亡 ==========
+                # ========== 死亡 ==========
         if operation == "死亡":
             src_grouped = grouped
             if not src_grouped:
@@ -1768,25 +1790,34 @@ def run():
                 if current == 0:
                     st.error("该池当前数量为 0，无法记录死亡！")
                 else:
+                    # ✅ 关键：form 必须设置 clear_on_submit=True
                     with st.form("death_record_form", clear_on_submit=True):
                         quantity = st.number_input("死亡数量", min_value=1, max_value=current, step=1,
                                                 key="death_qty")
                         note = st.text_area("备注（选填）", placeholder="如：病害、天气、人为等",
                                         key="death_note")
+                        # ✅ 文件上传必须放在 form 内部
                         uploaded_files = st.file_uploader(
                             "上传死亡现场照片（可一次选多张）",
                             type=["png", "jpg", "jpeg"],
                             accept_multiple_files=True,
                             key="death_images"
                         )
+                        # ✅ 提交按钮也在 form 内
                         submitted = st.form_submit_button("✅ 记录死亡", type="primary")
                         if submitted:
                             current_user = st.session_state.user['username']
-                            ok, msg = add_death_record(from_pond_id, quantity, note,
-                                                    uploaded_files, created_by=current_user)
+                            # ✅ 所有逻辑都在 submitted 分支内
+                            ok, msg = add_death_record(
+                                from_pond_id, 
+                                quantity, 
+                                note,
+                                uploaded_files,  # 可能为 None 或 list
+                                created_by=current_user
+                            )
                             if ok:
                                 st.success(f"✅ 死亡记录成功：{quantity} 只")
-                                st.rerun()
+                                st.rerun()  # 重新加载页面，清空状态
                             else:
                                 st.error(f"❌ 记录失败：{msg}")
 
@@ -1918,39 +1949,44 @@ def run():
                         st.error("❌ 无合法目标池")
                     else:
                         to_pond_id = pond_selector("目标池塘（转入）", pond_id_to_info, tgt_grouped, "transfer_tgt")
-
                         quantity = st.number_input("数量", min_value=1, value=500, step=50,
                                                 key="transfer_qty")
                         quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"],
                                                 key="transfer_desc")
                         description = st.text_input("操作描述", value=quick_desc or "日常转池",
                                                 key="transfer_note")
-
                         if st.button("✅ 执行转池", type="primary", key="transfer_submit"):
                             current_user = st.session_state.user['username']
-                            # 容量 & 数量检查
-                            to_pond = get_pond_by_id(to_pond_id)
-                            if to_pond[4] + quantity > to_pond[3]:
-                                st.error(f"❌ 目标池容量不足！")
-                                st.stop()
-                            from_pond = get_pond_by_id(from_pond_id)
-                            if from_pond[4] < quantity:
-                                st.error(f"❌ 源池数量不足！")
-                                st.stop()
-                            success, hint = add_stock_movement(
-                                movement_type='transfer',
-                                from_pond_id=from_pond_id,
-                                to_pond_id=to_pond_id,
-                                quantity=quantity,
-                                description=description,
-                                unit_price=None,
-                                created_by=current_user
-                            )
-                            if success:
-                                st.success(f"✅ 转池成功")
-                                st.rerun()
+                            
+                            # ========== 新增：蛙种一致性校验 ==========
+                            from_frog_type = pond_id_to_info[from_pond_id]["frog_type"]
+                            to_frog_type = pond_id_to_info[to_pond_id]["frog_type"]
+                            if from_frog_type != to_frog_type:
+                                st.error(f"❌ 转池失败：源池蛙种「{from_frog_type}」与目标池蛙种「{to_frog_type}」不一致，禁止混养！")
                             else:
-                                st.error(hint)
+                                # 容量 & 数量检查
+                                to_pond = get_pond_by_id(to_pond_id)
+                                if to_pond[4] + quantity > to_pond[3]:
+                                    st.error("❌ 目标池容量不足！")
+                                else:
+                                    from_pond = get_pond_by_id(from_pond_id)
+                                    if from_pond[4] < quantity:
+                                        st.error("❌ 源池数量不足！")
+                                    else:
+                                        success, hint = add_stock_movement(
+                                            movement_type='transfer',
+                                            from_pond_id=from_pond_id,
+                                            to_pond_id=to_pond_id,
+                                            quantity=quantity,
+                                            description=description,
+                                            unit_price=None,
+                                            created_by=current_user
+                                        )
+                                        if success:
+                                            st.success("✅ 转池成功")
+                                            st.rerun()
+                                        else:
+                                            st.error(hint)
 
         # ========== 最近库存变动记录（分页）==========
         st.markdown("---")
@@ -2016,7 +2052,7 @@ def run():
                 st.warning("没有更多数据了")
                 st.session_state.movement_page -= 1
 
-        # ========== 最近死亡记录（独立区块）==========
+                # ========== 最近死亡记录（独立区块）==========
         st.markdown("---")
         st.subheader("💀 最近死亡记录")
         page_size_death = 20
@@ -2034,44 +2070,22 @@ def run():
                 st.rerun()
         with col_info_d:
             st.caption(f"第 {current_page_d + 1} 页（每页 {page_size_death} 条）")
-
         offset_d = current_page_d * page_size_death
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT sm.id,
-                p.name AS pond_name,
-                sm.quantity,
-                sm.description,
-                sm.moved_at,
-                sm.created_by AS 操作人
-            FROM stock_movement_shiwa sm
-            JOIN pond_shiwa p ON sm.from_pond_id = p.id
-            LEFT JOIN death_image_shiwa di ON di.death_movement_id = sm.id
-            WHERE sm.movement_type = 'death'
-            ORDER BY sm.moved_at DESC
-            LIMIT %s OFFSET %s;
-        """, (page_size_death, offset_d))
-        death_rows = cur.fetchall()
-        death_ids = [r[0] for r in death_rows]
-        img_dict = defaultdict(list)
-        if death_ids:
-            cur.execute("SELECT death_movement_id, image_path FROM death_image_shiwa WHERE death_movement_id = ANY(%s);", (death_ids,))
-            for mid, path in cur.fetchall():
-                img_dict[mid].append(path)
-        cur.close(); conn.close()
 
-        if death_rows:
-            for mid, pond, qty, desc, moved_at, operator in death_rows:
+        # ✅ 使用新函数获取（每条记录只出现一次）
+        death_records = get_recent_death_records(limit=page_size_death, offset=offset_d)
+
+        if death_records:
+            for record in death_records:
+                mid, pond, qty, desc, moved_at, operator, img_paths = record
                 with st.expander(f"🪦 {pond} · {qty} 只 · {moved_at:%Y-%m-%d %H:%M} · 操作人：{operator}"):
                     st.write(f"**描述**：{desc}")
-                    imgs = img_dict.get(mid, [])
-                    if imgs:
+                    if img_paths:
                         st.markdown("**现场照片：**")
                         cols_per_row = 3
-                        for i in range(0, len(imgs), cols_per_row):
+                        for i in range(0, len(img_paths), cols_per_row):
                             cols = st.columns(cols_per_row)
-                            for j, img_path in enumerate(imgs[i:i+cols_per_row]):
+                            for j, img_path in enumerate(img_paths[i:i+cols_per_row]):
                                 if os.path.exists(img_path):
                                     with cols[j]:
                                         st.image(img_path, caption=f"照片 {i+j+1}", use_container_width=True)
@@ -2080,7 +2094,7 @@ def run():
                                         st.caption(f"照片 {i+j+1} 不存在")
                     else:
                         st.caption("🖼️ 无照片")
-            if len(death_rows) == page_size_death:
+            if len(death_records) == page_size_death:
                 st.info("✅ 还有更多死亡记录，请点击「下一页」查看")
             else:
                 st.success("已到最后一页")
