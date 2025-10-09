@@ -1828,19 +1828,23 @@ def run():
                             st.error(f"❌ 分配失败：{msg}")
 
             # ---------------- 孵化 ----------------
+            # ---------------- 孵化 ----------------
             elif operation == "孵化":
                 hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
                 if not hatch_grouped:
                     st.error("❌ 请先至少创建一个‘孵化池’")
                 else:
                     to_pond_id = pond_selector("孵化池", pond_id_to_info, hatch_grouped, "hatch")
+                    # 获取目标孵化池的 frog_type_id
+                    target_frog_type_id = pond_id_to_info[to_pond_id]["frog_type"]
 
-                    # ========== 新增：多选来源种蛙池 ==========
-                    # 获取所有“种蛙池”且数量 > 0 的池塘
+                    # ========== 新增：按蛙种过滤种蛙池 ==========
                     breeding_ponds = [
                         (pid, info["name"])
                         for pid, info in pond_id_to_info.items()
-                        if info["pond_type"] == "种蛙池" and info["current_count"] > 0
+                        if info["pond_type"] == "种蛙池"
+                        and info["frog_type"] == target_frog_type_id  # 👈 关键：蛙种必须一致
+                        and info["current_count"] > 0
                     ]
                     source_breeding_ids = []
                     if breeding_ponds:
@@ -1854,7 +1858,7 @@ def run():
                         if not source_breeding_ids:
                             st.info("未选择来源种蛙池（可选）")
                     else:
-                        st.info("暂无可用的种蛙池（需类型为“种蛙池”且数量 > 0）")
+                        st.info(f"暂无可用的【{pond_id_to_info[to_pond_id]['frog_type']}】种蛙池（需类型为“种蛙池”、同蛙种、且数量 > 0）")
 
                     # ========== 原有孵化输入 ==========
                     plate_input = st.text_input(
@@ -1873,20 +1877,17 @@ def run():
                         except Exception:
                             st.warning(f"板数格式无效：{plate_input}，已改用默认值 1000")
                             default_qty = 1000
-
                     quantity = st.number_input("数量", min_value=1, value=default_qty, step=50,
                                             key="hatch_qty")
                     quick_desc = st.selectbox("快捷描述", COMMON_REMARKS["操作描述"],
                                             key="hatch_desc")
                     base_description = st.text_input("操作描述", value=quick_desc or "自孵蝌蚪",
                                             key="hatch_note")
-
                     # 合并描述：加入来源信息
                     full_description = base_description
                     if source_breeding_ids:
                         pond_names = [next(p[1] for p in breeding_ponds if p[0] == pid) for pid in source_breeding_ids]
                         full_description += f" | 来源种蛙池: {', '.join(pond_names)}"
-
                     if st.button("✅ 执行孵化", type="primary", key="hatch_submit"):
                         current_user = st.session_state.user['username']
                         success, hint = add_stock_movement(
@@ -2091,11 +2092,56 @@ def run():
                 st.session_state.death_page -= 1
     with tab5:
         st.subheader("🛒 采购类型管理（含供应商 & 月度汇总）")
-
         current_user = st.session_state.user["username"]  # 当前登录用户
 
-        # ===== 1. 饲料类型（带库存+供应商） =====
-        st.markdown("#### 1. 饲料类型")
+        # ==================== 查询函数（带分页） ====================
+        def get_feed_purchase_records(limit=20, offset=0):
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT purchased_at, feed_type_name, quantity_kg, unit_price,
+                    total_amount, supplier, supplier_phone, purchased_by
+                FROM feed_purchase_record_shiwa
+                ORDER BY purchased_at DESC
+                LIMIT %s OFFSET %s;
+            """, (limit, offset))
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return rows
+
+        def get_frog_purchase_records(limit=20, offset=0):
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT purchased_at, frog_type_name, quantity, unit_price,
+                    total_amount, supplier, supplier_phone, purchased_by
+                FROM frog_purchase_record_shiwa
+                ORDER BY purchased_at DESC
+                LIMIT %s OFFSET %s;
+            """, (limit, offset))
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return rows
+
+        def count_feed_records():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM feed_purchase_record_shiwa;")
+            cnt = cur.fetchone()[0]
+            cur.close(); conn.close()
+            return cnt
+
+        def count_frog_records():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM frog_purchase_record_shiwa;")
+            cnt = cur.fetchone()[0]
+            cur.close(); conn.close()
+            return cnt
+        # ===========================================================
+
+        # ===== 1. 饲料类型（当前库存状态） =====
+        st.markdown("#### 1. 饲料库存状态（当前汇总）")
         def get_feed_types_with_stock():
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2108,21 +2154,34 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
+
         def add_feed_type_with_stock(name, price, stock_kg, supplier, phone, by):
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO feed_type_shiwa (name, unit_price, stock_kg,
-                                            supplier, supplier_phone, purchased_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (name) DO UPDATE
-                SET unit_price = EXCLUDED.unit_price,
-                    stock_kg   = EXCLUDED.stock_kg,
-                    supplier   = EXCLUDED.supplier,
-                    supplier_phone = EXCLUDED.supplier_phone,
-                    purchased_by   = EXCLUDED.purchased_by;
-            """, (name, price, stock_kg, supplier, phone, by))
-            conn.commit(); cur.close(); conn.close()
+            try:
+                # ① 更新库存状态表（保持 ON CONFLICT UPDATE）
+                cur.execute("""
+                    INSERT INTO feed_type_shiwa (name, unit_price, stock_kg,
+                                                supplier, supplier_phone, purchased_by)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE
+                    SET unit_price = EXCLUDED.unit_price,
+                        stock_kg   = feed_type_shiwa.stock_kg + EXCLUDED.stock_kg,  -- 👈 累加库存
+                        supplier   = EXCLUDED.supplier,
+                        supplier_phone = EXCLUDED.supplier_phone,
+                        purchased_by   = EXCLUDED.purchased_by;
+                """, (name, price, stock_kg, supplier, phone, by))
+
+                # ② 插入采购流水记录（独立一行）
+                cur.execute("""
+                    INSERT INTO feed_purchase_record_shiwa 
+                    (feed_type_name, quantity_kg, unit_price, total_amount, supplier, supplier_phone, purchased_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                """, (name, stock_kg, price, stock_kg * price, supplier, phone, by))
+
+                conn.commit()
+            finally:
+                cur.close(); conn.close()
 
         feed_types = get_feed_types_with_stock()
         if feed_types:
@@ -2130,24 +2189,28 @@ def run():
                                 columns=["ID", "名称", "单价(¥/kg)", "库存(kg)",
                                         "供应商", "联系方式", "采购人"])
             st.dataframe(df_f, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无饲料库存")
 
         with st.form("feed_type_form"):
             c1, c2, c3 = st.columns(3)
             with c1: fname = st.text_input("饲料名称")
             with c2: fprice = st.number_input("单价 (¥/kg)", min_value=0.0, step=1.0, value=20.0)
-            with c3: fstock = st.number_input("库存 (kg)", min_value=0.0, step=1.0, value=0.0)
+            with c3: fstock = st.number_input("本次采购数量 (kg)", min_value=0.0, step=1.0, value=0.0)
             c4, c5 = st.columns(2)
             with c4: fsupp = st.text_input("供应商", placeholder="如 XX 饲料厂")
             with c5: fphone = st.text_input("联系方式", placeholder="手机/固话")
-            # 采购人默认当前用户，只读
             st.text_input("采购人", value=current_user, disabled=True)
             if st.form_submit_button("✅ 添加/更新饲料"):
-                add_feed_type_with_stock(fname, fprice, fstock, fsupp, fphone, current_user)
-                st.success(f"饲料「{fname}」已保存")
-                st.rerun()
+                if not fname.strip():
+                    st.error("请输入饲料名称！")
+                else:
+                    add_feed_type_with_stock(fname, fprice, fstock, fsupp, fphone, current_user)
+                    st.success(f"饲料「{fname}」已保存，库存已累加，流水已记录")
+                    st.rerun()
 
-        # ===== 2. 蛙型 / 苗种（同套路） =====
-        st.markdown("#### 2. 蛙型 / 苗种")
+        # ===== 2. 蛙型 / 苗种（当前库存状态） =====
+        st.markdown("#### 2. 蛙苗库存状态（当前汇总）")
         def get_frog_purchase_types_with_supplier():
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2160,21 +2223,34 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
+
         def add_frog_type_with_supplier(name, price, qty, supplier, phone, by):
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO frog_purchase_type_shiwa
-                (name, unit_price, quantity, supplier, supplier_phone, purchased_by)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (name) DO UPDATE
-                SET unit_price = EXCLUDED.unit_price,
-                    quantity   = EXCLUDED.quantity,
-                    supplier   = EXCLUDED.supplier,
-                    supplier_phone = EXCLUDED.supplier_phone,
-                    purchased_by   = EXCLUDED.purchased_by;
-            """, (name, price, qty, supplier, phone, by))
-            conn.commit(); cur.close(); conn.close()
+            try:
+                # ① 更新蛙苗库存状态表（累加）
+                cur.execute("""
+                    INSERT INTO frog_purchase_type_shiwa
+                    (name, unit_price, quantity, supplier, supplier_phone, purchased_by)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE
+                    SET unit_price = EXCLUDED.unit_price,
+                        quantity   = frog_purchase_type_shiwa.quantity + EXCLUDED.quantity,  -- 👈 累加
+                        supplier   = EXCLUDED.supplier,
+                        supplier_phone = EXCLUDED.supplier_phone,
+                        purchased_by   = EXCLUDED.purchased_by;
+                """, (name, price, qty, supplier, phone, by))
+
+                # ② 插入蛙苗采购流水
+                cur.execute("""
+                    INSERT INTO frog_purchase_record_shiwa 
+                    (frog_type_name, quantity, unit_price, total_amount, supplier, supplier_phone, purchased_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                """, (name, qty, price, qty * price, supplier, phone, by))
+
+                conn.commit()
+            finally:
+                cur.close(); conn.close()
 
         frog_types = get_frog_purchase_types_with_supplier()
         if frog_types:
@@ -2182,44 +2258,112 @@ def run():
                                 columns=["ID", "名称", "单价(¥/只)", "数量(只)",
                                         "供应商", "联系方式", "采购人"])
             st.dataframe(df_t, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无蛙苗库存")
 
         with st.form("frog_type_form"):
             c1, c2, c3 = st.columns(3)
             with c1: tname = st.text_input("蛙型名称")
             with c2: tprice = st.number_input("单价 (¥/只)", min_value=0.1, step=1.0, value=20.0)
-            with c3: tqty = st.number_input("数量 (只)", min_value=0, step=50, value=0)
+            with c3: tqty = st.number_input("本次采购数量 (只)", min_value=0, step=50, value=0)
             c4, c5 = st.columns(2)
             with c4: tsupp = st.text_input("供应商", placeholder="如 XX 养殖场")
             with c5: tphone = st.text_input("联系方式", placeholder="手机/微信")
             st.text_input("采购人", value=current_user, disabled=True)
             if st.form_submit_button("✅ 添加/更新蛙型"):
-                add_frog_type_with_supplier(tname, tprice, tqty, tsupp, tphone, current_user)
-                st.success(f"蛙型「{tname}」已保存")
-                st.rerun()
+                if not tname.strip():
+                    st.error("请输入蛙型名称！")
+                else:
+                    add_frog_type_with_supplier(tname, tprice, tqty, tsupp, tphone, current_user)
+                    st.success(f"蛙型「{tname}」已保存，库存已累加，流水已记录")
+                    st.rerun()
 
-        # ===== 3. 月度采购汇总 =====
+        # ===== 3. 采购流水记录（带分页）=====
         st.markdown("---")
-        st.subheader("📊 月度采购汇总（饲料+蛙型）")
+        st.subheader("📜 采购流水记录（每次采购独立显示）")
+
+        PAGE_SIZE = 20
+
+        # --- 饲料采购流水分页 ---
+        st.markdown("##### 饲料采购流水")
+        total_feed = count_feed_records()
+        total_pages_feed = (total_feed + PAGE_SIZE - 1) // PAGE_SIZE
+        if "feed_purchase_page" not in st.session_state:
+            st.session_state.feed_purchase_page = 0
+        current_page_f = st.session_state.feed_purchase_page
+        current_page_f = max(0, min(current_page_f, total_pages_feed - 1))
+
+        col_prev_f, col_next_f, col_info_f = st.columns([1, 1, 3])
+        with col_prev_f:
+            if st.button("⬅️ 上一页", key="feed_prev", disabled=(current_page_f == 0)):
+                st.session_state.feed_purchase_page -= 1
+                st.rerun()
+        with col_next_f:
+            if st.button("下一页 ➡️", key="feed_next", disabled=(current_page_f >= total_pages_feed - 1)):
+                st.session_state.feed_purchase_page += 1
+                st.rerun()
+        with col_info_f:
+            st.caption(f"第 {current_page_f + 1} 页 / 共 {total_pages_feed or 1} 页（每页 {PAGE_SIZE} 条）")
+
+        feed_records = get_feed_purchase_records(limit=PAGE_SIZE, offset=current_page_f * PAGE_SIZE)
+        if feed_records:
+            df_feed = pd.DataFrame(feed_records, columns=[
+                "采购时间", "饲料名称", "数量(kg)", "单价(¥/kg)", "金额(¥)", "供应商", "联系方式", "采购人"
+            ])
+            st.dataframe(df_feed, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无饲料采购流水记录")
+
+        # --- 蛙苗采购流水分页 ---
+        st.markdown("##### 蛙苗采购流水")
+        total_frog = count_frog_records()
+        total_pages_frog = (total_frog + PAGE_SIZE - 1) // PAGE_SIZE
+        if "frog_purchase_page" not in st.session_state:
+            st.session_state.frog_purchase_page = 0
+        current_page_t = st.session_state.frog_purchase_page
+        current_page_t = max(0, min(current_page_t, total_pages_frog - 1))
+
+        col_prev_t, col_next_t, col_info_t = st.columns([1, 1, 3])
+        with col_prev_t:
+            if st.button("⬅️ 上一页", key="frog_prev", disabled=(current_page_t == 0)):
+                st.session_state.frog_purchase_page -= 1
+                st.rerun()
+        with col_next_t:
+            if st.button("下一页 ➡️", key="frog_next", disabled=(current_page_t >= total_pages_frog - 1)):
+                st.session_state.frog_purchase_page += 1
+                st.rerun()
+        with col_info_t:
+            st.caption(f"第 {current_page_t + 1} 页 / 共 {total_pages_frog or 1} 页（每页 {PAGE_SIZE} 条）")
+
+        frog_records = get_frog_purchase_records(limit=PAGE_SIZE, offset=current_page_t * PAGE_SIZE)
+        if frog_records:
+            df_frog = pd.DataFrame(frog_records, columns=[
+                "采购时间", "蛙型名称", "数量(只)", "单价(¥/只)", "金额(¥)", "供应商", "联系方式", "采购人"
+            ])
+            st.dataframe(df_frog, use_container_width=True, hide_index=True)
+        else:
+            st.info("暂无蛙苗采购流水记录")
+
+        # ===== 4. 月度采购汇总（基于流水表）=====
+        st.markdown("---")
+        st.subheader("📊 月度采购汇总（基于采购流水）")
         conn = get_db_connection()
-        # 饲料按月
-        # 饲料
+        # 饲料月度汇总（使用流水表）
         feed_month = pd.read_sql("""
-            SELECT date_trunc('month', created_at) AS 月份,
-                SUM(stock_kg)                   AS 采购量_kg,
-                SUM(stock_kg * unit_price)      AS 采购金额_元
-            FROM feed_type_shiwa
-            WHERE stock_kg > 0
+            SELECT date_trunc('month', purchased_at) AS 月份,
+                SUM(quantity_kg) AS 采购量_kg,
+                SUM(total_amount) AS 采购金额_元
+            FROM feed_purchase_record_shiwa
             GROUP BY 月份
             ORDER BY 月份 DESC;
         """, conn)
 
-        # 蛙型
+        # 蛙苗月度汇总（使用流水表）
         frog_month = pd.read_sql("""
-            SELECT date_trunc('month', created_at) AS 月份,
-                SUM(quantity)                   AS 采购量_只,
-                SUM(quantity * unit_price)      AS 采购金额_元
-            FROM frog_purchase_type_shiwa
-            WHERE quantity > 0
+            SELECT date_trunc('month', purchased_at) AS 月份,
+                SUM(quantity) AS 采购量_只,
+                SUM(total_amount) AS 采购金额_元
+            FROM frog_purchase_record_shiwa
             GROUP BY 月份
             ORDER BY 月份 DESC;
         """, conn)
