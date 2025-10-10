@@ -420,27 +420,7 @@ def update_pond_full(
     finally:
         cur.close()
         conn.close()
-def delete_all_test_data():
-    """⚠️ 清空所有测试数据：池塘、记录、客户等"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        # 1. 先删依赖 customer_shiwa 的 sale_record_shiwa
-        cur.execute("TRUNCATE TABLE sale_record_shiwa RESTART IDENTITY CASCADE;")
-        # 2. 再删客户表
-        cur.execute("TRUNCATE TABLE customer_shiwa RESTART IDENTITY CASCADE;")
-        # 3. 清空喂养和库存变动（含死亡、销售出库等）
-        cur.execute("TRUNCATE TABLE feeding_record_shiwa, stock_movement_shiwa RESTART IDENTITY CASCADE;")
-        # 4. 最后清空池塘（会级联清空 daily_log_shiwa 等）
-        cur.execute("TRUNCATE TABLE pond_shiwa RESTART IDENTITY CASCADE;")
-        conn.commit()
-        return True
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        cur.close()
-        conn.close()
+
 def get_pond_by_id(pond_id):
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1734,20 +1714,7 @@ def run():
                             st.rerun()
                         else:
                             st.error(f"❌ 修正失败：{msg}")
-            # ==========================================================
-
-            st.markdown("---")
-            st.subheader("⚠️ 危险区域：清空测试数据")
-            st.caption("**一键删除所有池塘、转池、喂养记录！操作不可恢复**")
-            if st.checkbox("我已确认要清空全部测试数据"):
-                if st.button("🗑️ 一键清空所有测试数据", type="secondary"):
-                    try:
-                        delete_all_test_data()
-                        st.success("✅ 所有测试数据已清空！")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ 清空失败: {e}")
-   
+ 
     # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
         st.subheader("🔄 转池 / 外购 / 孵化 / 死亡操作")

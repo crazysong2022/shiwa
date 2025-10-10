@@ -50,3 +50,4 @@ death_images/
 # Streamlit cache
 .streamlit/
 init_shiwa_db.py
+reset_db.py
