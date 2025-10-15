@@ -445,6 +445,58 @@ def get_pond_by_id(pond_id):
     cur.close()
     conn.close()
     return row  # (id, name, frog_type_id, max_capacity, current_count)
+def log_pond_change(
+    pond_id: int,
+    change_type: str,
+    old_values: dict,
+    new_values: dict,
+    change_date: datetime.date,
+    notes: str,
+    changed_by: str
+):
+    """记录池塘变更日志到 pond_change_log 表"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO pond_change_log (
+                pond_id, change_type,
+                old_name, new_name,
+                old_pond_type_id, new_pond_type_id,
+                old_frog_type_id, new_frog_type_id,
+                old_max_capacity, new_max_capacity,
+                old_current_count, new_current_count,
+                change_date, notes, changed_by
+            ) VALUES (
+                %(pond_id)s, %(change_type)s,
+                %(old_name)s, %(new_name)s,
+                %(old_pond_type_id)s, %(new_pond_type_id)s,
+                %(old_frog_type_id)s, %(new_frog_type_id)s,
+                %(old_max_capacity)s, %(new_max_capacity)s,
+                %(old_current_count)s, %(new_current_count)s,
+                %(change_date)s, %(notes)s, %(changed_by)s
+            );
+        """, {
+            "pond_id": pond_id,
+            "change_type": change_type,
+            "old_name": old_values.get("name"),
+            "new_name": new_values.get("name"),
+            "old_pond_type_id": old_values.get("pond_type_id"),
+            "new_pond_type_id": new_values.get("pond_type_id"),
+            "old_frog_type_id": old_values.get("frog_type_id"),
+            "new_frog_type_id": new_values.get("frog_type_id"),
+            "old_max_capacity": old_values.get("max_capacity"),
+            "new_max_capacity": new_values.get("max_capacity"),
+            "old_current_count": old_values.get("current_count"),
+            "new_current_count": new_values.get("current_count"),
+            "change_date": change_date,
+            "notes": notes or "",
+            "changed_by": changed_by
+        })
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 def _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type):
     cur = conn.cursor()
     cur.execute("SELECT frog_type_id FROM pond_shiwa WHERE id=%s", (to_pond_id,))
@@ -1489,11 +1541,10 @@ def run():
                             else:
                                 st.error(f"❌ 创建失败：{e}")
 
-                    # ==================== 合并：查看已建池塘 expander ====================
             with st.expander("🔍 查看已建池塘", expanded=False):
                 # ========== 已创建的池塘 ==========
                 st.markdown("### 📋 已创建的池塘")
-                ponds_now = get_all_ponds()  # 复用已有函数，实时查库
+                ponds_now = get_all_ponds()
                 if not ponds_now:
                     st.info("暂无池塘，快去创建第一个吧！")
                 else:
@@ -1501,36 +1552,41 @@ def run():
                         ponds_now,
                         columns=["ID", "名称", "池类型", "蛙种", "最大容量", "当前数量"]
                     )
-                    # 让最新创建的排在最上面
                     df = df.iloc[::-1].reset_index(drop=True)
                     st.dataframe(df, width='stretch', hide_index=True)
 
                 st.markdown("---")
 
-                # ========== 变更池塘用途 ==========
+                # ========== 变更池塘用途（仅当数量为 0）==========
                 st.markdown("### 🔄 变更池塘用途（仅当数量为 0 时可用）")
                 st.caption("适用于：已完成养殖周期的空池，重新赋予新用途")
-                # 取得所有空池
                 empty_ponds = [p for p in get_all_ponds() if p[5] == 0]
                 if not empty_ponds:
                     st.info("暂无空池，无法变更用途")
                 else:
-                    with st.form("change_purpose_form"):
-                        ep_dict = {ep[0]: f"{ep[1]}  （{ep[2]}|{ep[3]}）" for ep in empty_ponds}
+                    pond_types = get_pond_types()
+                    frog_types = get_frog_types()
+                    pond_type_map = {pt[0]: pt[1] for pt in pond_types}
+                    frog_type_map = {ft[0]: ft[1] for ft in frog_types}
+
+                    with st.form(key="change_purpose_form_unique"):
+                        ep_dict = {ep[0]: f"{ep[1]}  （{ep[2]}｜{ep[3]}）" for ep in empty_ponds}
                         pond_id = st.selectbox("选择空池", options=list(ep_dict.keys()),
                                             format_func=lambda x: ep_dict[x])
+                        current_pond = next(p for p in empty_ponds if p[0] == pond_id)
+
                         col1, col2 = st.columns(2)
                         with col1:
                             new_pt_id = st.selectbox(
                                 "新池塘类型",
-                                options=[pt[0] for pt in pond_types],
-                                format_func=lambda x: next(pt[1] for pt in pond_types if pt[0] == x)
+                                options=list(pond_type_map.keys()),
+                                format_func=lambda x: pond_type_map.get(x, f"未知类型({x})")
                             )
                         with col2:
                             new_ft_id = st.selectbox(
                                 "新蛙种类型",
-                                options=[ft[0] for ft in frog_types],
-                                format_func=lambda x: next(ft[1] for ft in frog_types if ft[0] == x)
+                                options=list(frog_type_map.keys()),
+                                format_func=lambda x: frog_type_map.get(x, f"未知蛙种({x})")
                             )
                         new_code = st.text_input("新编号", placeholder="如 002 或 B-202")
                         submitted = st.form_submit_button("✅ 确认变更", type="secondary")
@@ -1538,12 +1594,34 @@ def run():
                             if not new_code.strip():
                                 st.error("请输入新编号！")
                                 st.stop()
-                            # 拼接新名称：池类型 + 编号 + 蛙种（按新规则）
-                            new_frog = next(ft[1] for ft in frog_types if ft[0] == new_ft_id)
-                            new_type = next(pt[1] for pt in pond_types if pt[0] == new_pt_id)
-                            new_name = f"{new_type}{new_code.strip()}{new_frog}"  # ← 修改顺序
+                            new_name = f"{pond_type_map[new_pt_id]}{new_code.strip()}{frog_type_map[new_ft_id]}"
                             ok, msg = update_pond_identity(pond_id, new_name, new_pt_id, new_ft_id)
                             if ok:
+                                # ===== 记录日志 =====
+                                old_vals = {
+                                    "name": current_pond[1],
+                                    "pond_type_id": next(pt[0] for pt in pond_types if pt[1] == current_pond[2]),
+                                    "frog_type_id": next(ft[0] for ft in frog_types if ft[1] == current_pond[3]),
+                                    "max_capacity": current_pond[4],
+                                    "current_count": current_pond[5]
+                                }
+                                new_vals = {
+                                    "name": new_name,
+                                    "pond_type_id": new_pt_id,
+                                    "frog_type_id": new_ft_id,
+                                    "max_capacity": current_pond[4],
+                                    "current_count": current_pond[5]
+                                }
+                                current_user = st.session_state.user["username"]
+                                log_pond_change(
+                                    pond_id=pond_id,
+                                    change_type="变更用途",
+                                    old_values=old_vals,
+                                    new_values=new_vals,
+                                    change_date=datetime.today().date(),
+                                    notes="",
+                                    changed_by=current_user
+                                )
                                 st.success(f"✅ 池塘已变更为「{new_name}」！")
                                 st.rerun()
                             else:
@@ -1551,64 +1629,57 @@ def run():
 
                 st.markdown("---")
 
-                # ========== 修正创建错误 ==========
+                # ========== 修正创建错误（仅限从未使用过的池塘）==========
                 st.markdown("### ✏️ 修正创建错误（仅限从未使用过的池塘）")
                 st.caption("适用于：刚创建但未进行任何操作的池塘，可修改全部字段")
-                # 获取所有“干净”池塘（从未使用过）
                 all_ponds = get_all_ponds()
-                unused_ponds = []
-                for p in all_ponds:
-                    if is_pond_unused(p[0]):
-                        unused_ponds.append(p)
+                unused_ponds = [p for p in all_ponds if is_pond_unused(p[0])]
                 if not unused_ponds:
                     st.info("暂无符合条件的池塘（需从未参与任何操作）")
                 else:
-                    with st.form("correct_creation_form"):
+                    pond_types = get_pond_types()
+                    frog_types = get_frog_types()
+                    pond_type_map = {pt[0]: pt[1] for pt in pond_types}
+                    frog_type_map = {ft[0]: ft[1] for ft in frog_types}
+
+                    with st.form(key="correct_creation_form_unique"):
                         up_dict = {up[0]: f"{up[1]}  （{up[2]}｜{up[3]}｜当前{up[5]}只）" for up in unused_ponds}
                         pond_id = st.selectbox("选择池塘", options=list(up_dict.keys()),
                                             format_func=lambda x: up_dict[x])
                         current_pond = next(p for p in unused_ponds if p[0] == pond_id)
-                        current_max_cap = current_pond[4]
-                        current_count = current_pond[5]
 
                         col1, col2 = st.columns(2)
                         with col1:
                             new_pt_id = st.selectbox(
                                 "新池塘类型",
-                                options=[pt[0] for pt in pond_types],
-                                format_func=lambda x: next(pt[1] for pt in pond_types if pt[0] == x)
+                                options=list(pond_type_map.keys()),
+                                format_func=lambda x: pond_type_map.get(x, f"未知类型({x})")
                             )
                         with col2:
                             new_ft_id = st.selectbox(
                                 "新蛙种类型",
-                                options=[ft[0] for ft in frog_types],
-                                format_func=lambda x: next(ft[1] for ft in frog_types if ft[0] == x)
+                                options=list(frog_type_map.keys()),
+                                format_func=lambda x: frog_type_map.get(x, f"未知蛙种({x})")
                             )
                         new_code = st.text_input("新编号", placeholder="如 002 或 B-202")
-                        new_max_cap = st.number_input("最大容量（只）", min_value=1, value=current_max_cap, step=10)
-
-                        # ✅ 关键修复：确保当前数量不超过新容量
-                        safe_current_count = min(current_count, new_max_cap)
+                        new_max_cap = st.number_input("最大容量（只）", min_value=1, value=current_pond[4], step=10)
+                        # ✅ 关键：不限制 max_value，允许自由输入
                         new_current_count = st.number_input(
                             "当前数量（只）",
                             min_value=0,
-                            max_value=new_max_cap,
-                            value=safe_current_count,  # ← 不再可能超过 max_value
+                            value=current_pond[5],
                             step=1
                         )
 
-                        # ✅ 提交按钮（确保在 form 内）
                         submitted = st.form_submit_button("✅ 修正创建信息", type="secondary")
                         if submitted:
                             if not new_code.strip():
                                 st.error("请输入新编号！")
                                 st.stop()
-                            if new_current_count > new_max_cap:  # 虽然理论上不会发生，但保留校验
-                                st.error("当前数量不能超过最大容量！")
+                            if new_current_count > new_max_cap:
+                                st.error(f"❌ 当前数量（{new_current_count}）不能超过最大容量（{new_max_cap}）！")
                                 st.stop()
-                            new_frog = next(ft[1] for ft in frog_types if ft[0] == new_ft_id)
-                            new_type = next(pt[1] for pt in pond_types if pt[0] == new_pt_id)
-                            new_name = f"{new_type}{new_code.strip()}{new_frog}"
+                            new_name = f"{pond_type_map[new_pt_id]}{new_code.strip()}{frog_type_map[new_ft_id]}"
                             ok, msg = update_pond_full(
                                 pond_id=pond_id,
                                 new_name=new_name,
@@ -1618,11 +1689,83 @@ def run():
                                 new_current_count=new_current_count
                             )
                             if ok:
+                                # ===== 记录日志 =====
+                                old_vals = {
+                                    "name": current_pond[1],
+                                    "pond_type_id": next(pt[0] for pt in pond_types if pt[1] == current_pond[2]),
+                                    "frog_type_id": next(ft[0] for ft in frog_types if ft[1] == current_pond[3]),
+                                    "max_capacity": current_pond[4],
+                                    "current_count": current_pond[5]
+                                }
+                                new_vals = {
+                                    "name": new_name,
+                                    "pond_type_id": new_pt_id,
+                                    "frog_type_id": new_ft_id,
+                                    "max_capacity": new_max_cap,
+                                    "current_count": new_current_count
+                                }
+                                current_user = st.session_state.user["username"]
+                                log_pond_change(
+                                    pond_id=pond_id,
+                                    change_type="修正创建",
+                                    old_values=old_vals,
+                                    new_values=new_vals,
+                                    change_date=datetime.today().date(),
+                                    notes="",
+                                    changed_by=current_user
+                                )
                                 st.success(f"✅ 池塘已修正为「{new_name}」！容量：{new_max_cap}，数量：{new_current_count}")
                                 st.rerun()
                             else:
                                 st.error(f"❌ 修正失败：{msg}")
- 
+
+                st.markdown("---")
+
+                # ========== 池塘变更历史（备查）==========
+                with st.expander("📜 池塘变更历史（备查）", expanded=False):
+                    try:
+                        conn = get_db_connection()
+                        df_log = pd.read_sql("""
+                            SELECT 
+                                p.name AS 池塘,
+                                change_type AS 类型,
+                                change_date AS 业务日期,
+                                old_name AS 原名称,
+                                new_name AS 新名称,
+                                pt_old.name AS 原池型,
+                                pt_new.name AS 新池型,
+                                ft_old.name AS 原蛙种,
+                                ft_new.name AS 新蛙种,
+                                old_max_capacity AS 原最大容量,
+                                new_max_capacity AS 新最大容量,
+                                old_current_count AS 原数量,
+                                new_current_count AS 新数量,
+                                notes AS 备注,
+                                changed_by AS 操作人,
+                                changed_at AS 系统时间
+                            FROM pond_change_log l
+                            JOIN pond_shiwa p ON l.pond_id = p.id
+                            LEFT JOIN pond_type_shiwa pt_old ON l.old_pond_type_id = pt_old.id
+                            LEFT JOIN pond_type_shiwa pt_new ON l.new_pond_type_id = pt_new.id
+                            LEFT JOIN frog_type_shiwa ft_old ON l.old_frog_type_id = ft_old.id
+                            LEFT JOIN frog_type_shiwa ft_new ON l.new_frog_type_id = ft_new.id
+                            ORDER BY l.changed_at DESC;
+                        """, conn)
+                        conn.close()
+
+                        if not df_log.empty:
+                            st.dataframe(df_log, width='stretch', hide_index=True)
+                            csv_data = df_log.to_csv(index=False).encode('utf-8')
+                            st.download_button(
+                                label="📥 导出变更日志 CSV",
+                                data=csv_data,
+                                file_name="pond_change_log.csv",
+                                mime="text/csv"
+                            )
+                        else:
+                            st.info("暂无变更记录")
+                    except Exception as e:
+                        st.error(f"⚠️ 加载变更日志失败：{e}")
     # ----------------------------- Tab 4: 转池 · 外购 · 孵化 -----------------------------
     with tab4:
 

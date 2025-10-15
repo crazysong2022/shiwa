@@ -272,7 +272,29 @@ SQLS = [
           ON sm.to_pond_id = p.id
          AND sm.movement_type IN ('purchase','hatch')
     WHERE p.current_count > 0;
+    """,
+        # 18. 池塘元信息变更日志（用于“修正创建”和“变更用途”审计）
     """
+    CREATE TABLE IF NOT EXISTS pond_change_log (
+        id SERIAL PRIMARY KEY,
+        pond_id INTEGER NOT NULL REFERENCES pond_shiwa(id) ON DELETE CASCADE,
+        change_type VARCHAR(20) NOT NULL CHECK (change_type IN ('修正创建', '变更用途')),
+        old_name TEXT,
+        new_name TEXT,
+        old_pond_type_id INTEGER,
+        new_pond_type_id INTEGER,
+        old_frog_type_id INTEGER,
+        new_frog_type_id INTEGER,
+        old_max_capacity INTEGER,
+        new_max_capacity INTEGER,
+        old_current_count INTEGER,
+        new_current_count INTEGER,
+        change_date DATE NOT NULL,
+        notes TEXT,
+        changed_by VARCHAR(50),
+        changed_at TIMESTAMP DEFAULT NOW()
+    );
+    """,
 ]
 
 def main():
