@@ -1567,7 +1567,6 @@ def run():
                         up_dict = {up[0]: f"{up[1]}  （{up[2]}｜{up[3]}｜当前{up[5]}只）" for up in unused_ponds}
                         pond_id = st.selectbox("选择池塘", options=list(up_dict.keys()),
                                             format_func=lambda x: up_dict[x])
-
                         current_pond = next(p for p in unused_ponds if p[0] == pond_id)
                         current_max_cap = current_pond[4]
                         current_count = current_pond[5]
@@ -1585,26 +1584,31 @@ def run():
                                 options=[ft[0] for ft in frog_types],
                                 format_func=lambda x: next(ft[1] for ft in frog_types if ft[0] == x)
                             )
-
                         new_code = st.text_input("新编号", placeholder="如 002 或 B-202")
                         new_max_cap = st.number_input("最大容量（只）", min_value=1, value=current_max_cap, step=10)
-                        new_current_count = st.number_input("当前数量（只）", min_value=0, max_value=new_max_cap, value=current_count, step=1)
 
-                        # ✅ 修复：添加提交按钮
+                        # ✅ 关键修复：确保当前数量不超过新容量
+                        safe_current_count = min(current_count, new_max_cap)
+                        new_current_count = st.number_input(
+                            "当前数量（只）",
+                            min_value=0,
+                            max_value=new_max_cap,
+                            value=safe_current_count,  # ← 不再可能超过 max_value
+                            step=1
+                        )
+
+                        # ✅ 提交按钮（确保在 form 内）
                         submitted = st.form_submit_button("✅ 修正创建信息", type="secondary")
-
                         if submitted:
                             if not new_code.strip():
                                 st.error("请输入新编号！")
                                 st.stop()
-                            if new_current_count > new_max_cap:
+                            if new_current_count > new_max_cap:  # 虽然理论上不会发生，但保留校验
                                 st.error("当前数量不能超过最大容量！")
                                 st.stop()
-
                             new_frog = next(ft[1] for ft in frog_types if ft[0] == new_ft_id)
                             new_type = next(pt[1] for pt in pond_types if pt[0] == new_pt_id)
                             new_name = f"{new_type}{new_code.strip()}{new_frog}"
-
                             ok, msg = update_pond_full(
                                 pond_id=pond_id,
                                 new_name=new_name,
