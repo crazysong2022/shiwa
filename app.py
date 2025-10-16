@@ -356,14 +356,18 @@ def update_pond_identity(pond_id: int,
                         new_frog_type_id: int) -> tuple[bool, str]:
     """
     变更池塘身份（名称、类型、蛙种）
-    仅允许从未被使用的池塘修改（无喂养、无 movement、无日志）
-    允许有初始数量，但不能有任何操作记录
+    仅要求当前数量为 0，允许曾参与过业务流程（喂养/转池/日志等）
     """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        if not is_pond_unused(pond_id):
-            return False, "池塘已参与业务流程（喂养/转池/日志等），无法变更用途"
+        # ✅ 新逻辑：只检查 current_count 是否为 0
+        cur.execute("SELECT current_count FROM pond_shiwa WHERE id = %s;", (pond_id,))
+        row = cur.fetchone()
+        if not row:
+            return False, "池塘不存在"
+        if row[0] != 0:
+            return False, "池塘当前数量不为 0，无法变更用途"
 
         cur.execute("""
             UPDATE pond_shiwa
