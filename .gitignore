@@ -51,3 +51,4 @@ death_images/
 .streamlit/
 init_shiwa_db.py
 reset_db.py
+main.py

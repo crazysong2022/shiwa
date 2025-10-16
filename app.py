@@ -512,35 +512,87 @@ def _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type):
         VALUES (%s, %s, %s, %s, CURRENT_DATE, %s)
     """, (movement_id, to_pond_id, frog_type_id, quantity, stage))
 def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
-                       description, unit_price=None, created_by=None, moved_at=None):
+                       description, unit_price=None, created_by=None, moved_at=None, frog_type_id=None):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 使用传入的时间，否则用当前时间
         actual_moved_at = moved_at or datetime.utcnow()
-        cur.execute("""
-            INSERT INTO stock_movement_shiwa
-            (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id;
-        """, (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, actual_moved_at))
-        movement_id = cur.fetchone()[0]
-        # ...（其余逻辑不变）
-        _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type)
+        
+        # ========== 处理采购分配：扣采购库存 + 加池塘数量 ==========
+        if movement_type == 'purchase':
+            if frog_type_id is None or to_pond_id is None:
+                raise ValueError("外购操作必须提供 frog_type_id 和 to_pond_id")
+            # 扣采购库存
+            cur.execute("SELECT quantity FROM frog_purchase_type_shiwa WHERE id = %s FOR UPDATE;", (frog_type_id,))
+            row = cur.fetchone()
+            if not row or row[0] < quantity:
+                raise ValueError("采购库存不足")
+            cur.execute("UPDATE frog_purchase_type_shiwa SET quantity = quantity - %s WHERE id = %s;", (quantity, frog_type_id))
+            # 加目标池数量
+            cur.execute("UPDATE pond_shiwa SET current_count = current_count + %s WHERE id = %s;", (quantity, to_pond_id))
+            # 插入 movement
+            cur.execute("""
+                INSERT INTO stock_movement_shiwa
+                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, ('purchase', None, to_pond_id, quantity, description, unit_price, created_by, actual_moved_at))
+            movement_id = cur.fetchone()[0]
+            _log_life_start(conn, movement_id, to_pond_id, quantity, 'purchase')
+        
+        # ========== 其他类型：转池 / 孵化 / 死亡 ==========
+        else:
+            if movement_type == 'transfer':
+                if from_pond_id is None or to_pond_id is None:
+                    raise ValueError("转池必须指定源池和目标池")
+                cur.execute("UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;", (quantity, from_pond_id))
+                cur.execute("UPDATE pond_shiwa SET current_count = current_count + %s WHERE id = %s;", (quantity, to_pond_id))
+            elif movement_type == 'hatch':
+                if to_pond_id is None:
+                    raise ValueError("孵化必须指定目标池")
+                cur.execute("UPDATE pond_shiwa SET current_count = current_count + %s WHERE id = %s;", (quantity, to_pond_id))
+            elif movement_type == 'death':
+                if from_pond_id is None:
+                    raise ValueError("死亡必须指定源池")
+                cur.execute("UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;", (quantity, from_pond_id))
+            else:
+                raise ValueError(f"不支持的 movement_type: {movement_type}")
+            
+            cur.execute("""
+                INSERT INTO stock_movement_shiwa
+                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, actual_moved_at))
+            movement_id = cur.fetchone()[0]
+            if movement_type in ('transfer', 'hatch'):
+                _log_life_start(conn, movement_id, to_pond_id, quantity, movement_type)
+
         conn.commit()
         return True, None
     except Exception as e:
         conn.rollback()
-        # ...（错误处理不变）
+        return False, str(e)
     finally:
         cur.close()
         conn.close()
 
 def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_files=None, created_by: str = None, moved_at=None):
+    """
+    记录死亡事件：
+    1. 扣减源池 current_count
+    2. 插入 stock_movement_shiwa（movement_type='death'）
+    3. 保存死亡照片（如有）
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         actual_moved_at = moved_at or datetime.utcnow()
+        
+        # ✅ 关键修复：先扣减源池数量
+        cur.execute("UPDATE pond_shiwa SET current_count = current_count - %s WHERE id = %s;", (quantity, from_pond_id))
+        
+        # 插入 movement 记录
         cur.execute("""
             INSERT INTO stock_movement_shiwa
             (movement_type, from_pond_id, to_pond_id, quantity, description, created_by, moved_at)
@@ -548,7 +600,26 @@ def add_death_record(from_pond_id: int, quantity: int, note: str = "", image_fil
             RETURNING id;
         """, (from_pond_id, quantity, note or f"死亡 {quantity} 只", created_by, actual_moved_at))
         movement_id = cur.fetchone()[0]
-        # ...（其余逻辑不变）
+
+        # ========== 保存死亡照片（如有）==========
+        if image_files:
+            for uploaded_file in image_files:
+                if uploaded_file is not None:
+                    # 生成唯一文件名
+                    ext = os.path.splitext(uploaded_file.name)[1].lower()
+                    if ext not in ['.png', '.jpg', '.jpeg']:
+                        continue  # 跳过非图片
+                    unique_filename = f"{uuid.uuid4().hex}{ext}"
+                    save_path = os.path.join(DEATH_IMAGE_DIR, unique_filename)
+                    # 保存文件
+                    with open(save_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    # 记录到数据库
+                    cur.execute("""
+                        INSERT INTO death_image_shiwa (death_movement_id, image_path)
+                        VALUES (%s, %s);
+                    """, (movement_id, save_path))
+
         conn.commit()
         return True, None
     except Exception as e:
@@ -1057,32 +1128,27 @@ def run():
         return rows
 
     def allocate_frog_purchase(frog_type_id, to_pond_id, quantity, description, created_by, moved_at=None):
+        # 获取单价
         conn = get_db_connection()
         cur = conn.cursor()
-        try:
-            actual_moved_at = moved_at or datetime.utcnow()
-            cur.execute("SELECT quantity FROM frog_purchase_type_shiwa WHERE id = %s;", (frog_type_id,))
-            row = cur.fetchone()
-            if not row or row[0] < quantity:
-                return False, "库存不足，无法分配"
-            cur.execute("""
-                INSERT INTO stock_movement_shiwa
-                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at)
-                VALUES ('purchase', NULL, %s, %s, %s, 
-                        (SELECT unit_price FROM frog_purchase_type_shiwa WHERE id = %s),
-                        %s, %s)
-                RETURNING id;
-            """, (to_pond_id, quantity, description, frog_type_id, created_by, actual_moved_at))
-            movement_id = cur.fetchone()[0]
-            # ...（其余逻辑不变）
-            conn.commit()
-            return True, None
-        except Exception as e:
-            conn.rollback()
-            return False, str(e)
-        finally:
-            cur.close()
-            conn.close()
+        cur.execute("SELECT unit_price FROM frog_purchase_type_shiwa WHERE id = %s;", (frog_type_id,))
+        unit_price = cur.fetchone()
+        cur.close()
+        conn.close()
+        unit_price = unit_price[0] if unit_price else 20.0
+
+        # 直接调用 add_stock_movement，它会处理库存扣减 + 池塘增加
+        return add_stock_movement(
+            movement_type='purchase',
+            from_pond_id=None,
+            to_pond_id=to_pond_id,
+            quantity=quantity,
+            description=description,
+            unit_price=unit_price,
+            created_by=created_by,
+            moved_at=moved_at,
+            frog_type_id=frog_type_id  # 👈 新增参数
+        )
     # >>>>>>>>>>>>>>>>>> 函数定义结束 <<<<<<<<<<<<<<<<<<
     st.markdown("---")
     # 创建三个 Tab（你原有的 7 个 Tab）
@@ -1848,25 +1914,48 @@ def run():
                         selected_frog = next(f for f in available_frogs if f[0] == frog_id)
                         max_qty = selected_frog[3]
                         to_pond_id = pond_selector("目标池塘", pond_id_to_info, grouped, "allocate_pond")
-                        pick_qty = st.number_input("分配数量", min_value=1, max_value=max_qty, step=50, key="allocate_qty")
-                        pick_note = st.text_input("备注", value="外购入库分配", key="allocate_note")
-                        
-                        # ===== 新增：操作时间 =====
-                        moved_at_date = st.date_input("操作日期", value=datetime.today(), key="purchase_date")
-                        moved_at_time = st.time_input("操作时间", value=datetime.now().time(), key="purchase_time")
-                        moved_at = datetime.combine(moved_at_date, moved_at_time)
-                        
-                        if st.button("✅ 执行分配", type="primary", key="allocate_submit"):
-                            current_user = st.session_state.user['username']
-                            success, msg = allocate_frog_purchase(
-                                frog_id, to_pond_id, pick_qty, pick_note, current_user, moved_at=moved_at
-                            )
-                            if success:
-                                st.success(f"✅ 分配成功：{pick_qty} 只 {selected_frog[1]} 已入池")
-                                st.rerun()
-                            else:
-                                st.error(f"❌ 分配失败：{msg}")
 
+                        # 👇 新增：获取目标池塘的容量和当前数量
+                        target_pond_info = pond_id_to_info[to_pond_id]
+                        max_cap = target_pond_info["max_capacity"]
+                        current_count = target_pond_info["current_count"]
+                        remaining_capacity = max_cap - current_count
+
+                        if remaining_capacity <= 0:
+                            st.error(f"❌ 目标池塘「{target_pond_info['name']}」已满（容量 {max_cap}，当前 {current_count}），无法分配！")
+                            st.stop()
+
+                        # 分配数量上限 = min(采购库存, 池塘剩余容量)
+                        alloc_max = min(max_qty, remaining_capacity)
+
+                        if alloc_max <= 0:
+                            st.error("❌ 目标池塘无剩余容量，或采购库存不足，无法分配。")
+                        else:
+                            pick_qty = st.number_input(
+                                "分配数量",
+                                min_value=1,
+                                max_value=alloc_max,
+                                value=min(50, alloc_max),  # 默认值不超过上限
+                                step=50,
+                                key="allocate_qty"
+                            )
+                            pick_note = st.text_input("备注", value="外购入库分配", key="allocate_note")
+                            # ===== 新增：操作时间 =====
+                            moved_at_date = st.date_input("操作日期", value=datetime.today(), key="purchase_date_op")
+                            moved_at_time = st.time_input("操作时间", value=datetime.now().time(), key="purchase_time_op")
+                            moved_at = datetime.combine(moved_at_date, moved_at_time)
+
+                            if st.button("✅ 执行分配", type="primary", key="allocate_submit_op"):
+                                current_user = st.session_state.user['username']
+                                success, msg = allocate_frog_purchase(
+                                    frog_id, to_pond_id, pick_qty, pick_note, current_user, moved_at=moved_at
+                                )
+                                if success:
+                                    st.success(f"✅ 分配成功：{pick_qty} 只 {selected_frog[1]} 已入池")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ 分配失败：{msg}")
+                        
                 # ---------------- 孵化 ----------------
                 elif operation == "孵化":
                     hatch_grouped = {k: v for k, v in grouped.items() if k == "孵化池"}
@@ -2119,7 +2208,6 @@ def run():
                     
     with tab5:
         current_user = st.session_state.user["username"]
-
         # ==================== 辅助函数（保持不变） ====================
         def get_feed_stock_summary():
             conn = get_db_connection()
@@ -2132,7 +2220,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def get_frog_stock_summary():
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2144,7 +2231,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def get_feed_records_by_name(name):
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2158,7 +2244,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def get_frog_records_by_name(name):
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2172,7 +2257,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def get_feed_consumption_records(name):
             """获取该饲料的所有投喂（消耗）记录"""
             conn = get_db_connection()
@@ -2194,7 +2278,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def add_feed_purchase(name, price, qty, supplier, phone, by):
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2219,7 +2302,6 @@ def run():
                 conn.commit()
             finally:
                 cur.close(); conn.close()
-
         def add_frog_purchase(name, price, qty, supplier, phone, by):
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2244,8 +2326,7 @@ def run():
                 conn.commit()
             finally:
                 cur.close(); conn.close()
-
-        # ==================== 1. 查看采购流水（放入 expander） ====================
+        # ==================== 1. 查看库存变动（放入 expander） ====================
         with st.expander("📄 查看库存变动", expanded=False):
             col1, col2 = st.columns(2)
             with col1:
@@ -2270,15 +2351,12 @@ def run():
                             st.session_state.viewing_frog = name
                 else:
                     st.info("暂无蛙苗库存")
-
-            # ==================== 饲料详情（修复库存计算） ====================
+            # ==================== 饲料详情（仅查看，无编辑） ====================
             if "viewing_feed" in st.session_state:
                 name = st.session_state.viewing_feed
                 st.markdown(f"### 📄 饲料「{name}」完整流水（采购 + 投喂）")
-                
                 purchase_records = get_feed_records_by_name(name)
                 consumption_records = get_feed_consumption_records(name)
-                
                 all_records = []
                 for r in purchase_records:
                     all_records.append({
@@ -2296,97 +2374,28 @@ def run():
                         "type": "出库",
                         "time": r[0],
                         "pond": r[1],
-                        "quantity": r[2],  # 保持正数
+                        "quantity": r[2],
                         "unit_price": r[3],
                         "total": r[4],
                         "operator": r[5],
                         "notes": "投喂消耗"
                     })
-                
                 all_records.sort(key=lambda x: x["time"], reverse=True)
-                
                 if all_records:
                     total_in = sum(r["quantity"] for r in all_records if r["type"] == "入库")
-                    total_out = sum(r["quantity"] for r in all_records if r["type"] == "出库")  # 正数总和
-                    current_stock = total_in - total_out  # ✅ 修正：采购 - 投喂
+                    total_out = sum(r["quantity"] for r in all_records if r["type"] == "出库")
+                    current_stock = total_in - total_out
                     st.info(f"**当前总库存：{current_stock:.2f} kg**（采购 {total_in:.2f} kg，已投喂 {total_out:.2f} kg）")
-                    
                     df = pd.DataFrame(all_records)
                     df = df[["type", "time", "pond", "quantity", "unit_price", "total", "operator", "notes"]]
                     df.columns = ["类型", "时间", "池塘", "数量(kg)", "单价(¥/kg)", "金额(¥)", "操作人", "备注"]
                     st.dataframe(df, width='stretch', hide_index=True)
-                    
-                    # 编辑采购记录（略，保持不变）
-                    st.markdown("#### ✏️ 编辑或删除采购记录（仅入库）")
-                    if purchase_records:
-                        record_id = st.selectbox(
-                            "选择要编辑的采购记录（ID）",
-                            options=[r[0] for r in purchase_records],
-                            format_func=lambda x: f"ID {x} - {next(r[2] for r in purchase_records if r[0]==x)} kg"
-                        )
-                        if record_id:
-                            conn = get_db_connection()
-                            cur = conn.cursor()
-                            cur.execute("""
-                                SELECT feed_type_name, quantity_kg, unit_price, supplier, supplier_phone
-                                FROM feed_purchase_record_shiwa WHERE id = %s;
-                            """, (record_id,))
-                            rec = cur.fetchone()
-                            cur.close(); conn.close()
-                            if rec:
-                                with st.form(f"edit_feed_{record_id}"):
-                                    c1, c2, c3 = st.columns(3)
-                                    with c1: e_name = st.text_input("饲料名称", value=rec[0])
-                                    with c2: e_qty = st.number_input("数量(kg)", min_value=0.0, step=1.0, value=float(rec[1]))
-                                    with c3: e_price = st.number_input("单价(¥/kg)", min_value=0.0, step=0.1, value=float(rec[2]))
-                                    c4, c5 = st.columns(2)
-                                    with c4: e_supp = st.text_input("供应商", value=rec[3] or "")
-                                    with c5: e_phone = st.text_input("联系方式", value=rec[4] or "")
-                                    col_del, col_save = st.columns([1, 3])
-                                    delete = col_del.form_submit_button("🗑️ 删除", type="secondary")
-                                    save = col_save.form_submit_button("💾 保存", type="primary")
-                                    if save:
-                                        total_amt = e_qty * e_price
-                                        conn = get_db_connection()
-                                        cur = conn.cursor()
-                                        try:
-                                            cur.execute("""
-                                                UPDATE feed_purchase_record_shiwa
-                                                SET feed_type_name = %s, quantity_kg = %s, unit_price = %s,
-                                                    total_amount = %s, supplier = %s, supplier_phone = %s
-                                                WHERE id = %s;
-                                            """, (e_name, e_qty, e_price, total_amt, e_supp, e_phone, record_id))
-                                            conn.commit()
-                                            st.success("✅ 更新成功！库存已自动重新计算。")
-                                            st.rerun()
-                                        except Exception as e:
-                                            conn.rollback()
-                                            st.error(f"❌ 更新失败：{e}")
-                                        finally:
-                                            cur.close(); conn.close()
-                                    if delete:
-                                        conn = get_db_connection()
-                                        cur = conn.cursor()
-                                        try:
-                                            cur.execute("DELETE FROM feed_purchase_record_shiwa WHERE id = %s;", (record_id,))
-                                            conn.commit()
-                                            st.success("✅ 删除成功！库存已自动重新计算。")
-                                            st.rerun()
-                                        except Exception as e:
-                                            conn.rollback()
-                                            st.error(f"❌ 删除失败：{e}")
-                                        finally:
-                                            cur.close(); conn.close()
-                    else:
-                        st.info("无采购记录可编辑")
                 else:
                     st.warning("无任何记录")
-                
                 if st.button("⬅️ 返回库存总览", key="close_feed_detail"):
                     del st.session_state.viewing_feed
                     st.rerun()
-
-            # ==================== 蛙苗详情（保持不变） ====================
+            # ==================== 蛙苗详情（仅查看，无编辑） ====================
             if "viewing_frog" in st.session_state:
                 name = st.session_state.viewing_frog
                 st.markdown(f"### 📄 蛙苗「{name}」采购详情")
@@ -2398,73 +2407,12 @@ def run():
                         "ID", "采购时间", "数量(只)", "单价(¥/只)", "金额(¥)", "供应商", "联系方式", "采购人"
                     ])
                     st.dataframe(df.drop(columns=["ID"]), width='stretch', hide_index=True)
-                    # 编辑功能（略）
-                    st.markdown("#### ✏️ 编辑或删除记录")
-                    record_id = st.selectbox(
-                        "选择要编辑的记录（ID）",
-                        options=[r[0] for r in records],
-                        format_func=lambda x: f"ID {x} - {next(r[2] for r in records if r[0]==x)} 只"
-                    )
-                    if record_id:
-                        conn = get_db_connection()
-                        cur = conn.cursor()
-                        cur.execute("""
-                            SELECT frog_type_name, quantity, unit_price, supplier, supplier_phone
-                            FROM frog_purchase_record_shiwa WHERE id = %s;
-                        """, (record_id,))
-                        rec = cur.fetchone()
-                        cur.close(); conn.close()
-                        if rec:
-                            with st.form(f"edit_frog_{record_id}"):
-                                c1, c2, c3 = st.columns(3)
-                                with c1: e_name = st.text_input("蛙型名称", value=rec[0])
-                                with c2: e_qty = st.number_input("数量(只)", min_value=0, step=1, value=int(rec[1]))
-                                with c3: e_price = st.number_input("单价(¥/只)", min_value=0.1, step=0.1, value=float(rec[2]))
-                                c4, c5 = st.columns(2)
-                                with c4: e_supp = st.text_input("供应商", value=rec[3] or "")
-                                with c5: e_phone = st.text_input("联系方式", value=rec[4] or "")
-                                col_del, col_save = st.columns([1, 3])
-                                delete = col_del.form_submit_button("🗑️ 删除", type="secondary")
-                                save = col_save.form_submit_button("💾 保存", type="primary")
-                                if save:
-                                    total_amt = e_qty * e_price
-                                    conn = get_db_connection()
-                                    cur = conn.cursor()
-                                    try:
-                                        cur.execute("""
-                                            UPDATE frog_purchase_record_shiwa
-                                            SET frog_type_name = %s, quantity = %s, unit_price = %s,
-                                                total_amount = %s, supplier = %s, supplier_phone = %s
-                                            WHERE id = %s;
-                                        """, (e_name, e_qty, e_price, total_amt, e_supp, e_phone, record_id))
-                                        conn.commit()
-                                        st.success("✅ 更新成功！库存已自动重新计算。")
-                                        st.rerun()
-                                    except Exception as e:
-                                        conn.rollback()
-                                        st.error(f"❌ 更新失败：{e}")
-                                    finally:
-                                        cur.close(); conn.close()
-                                if delete:
-                                    conn = get_db_connection()
-                                    cur = conn.cursor()
-                                    try:
-                                        cur.execute("DELETE FROM frog_purchase_record_shiwa WHERE id = %s;", (record_id,))
-                                        conn.commit()
-                                        st.success("✅ 删除成功！库存已自动重新计算。")
-                                        st.rerun()
-                                    except Exception as e:
-                                        conn.rollback()
-                                        st.error(f"❌ 删除失败：{e}")
-                                    finally:
-                                        cur.close(); conn.close()
                 else:
                     st.warning("无采购记录")
                 if st.button("⬅️ 返回库存总览", key="close_frog_detail"):
                     del st.session_state.viewing_frog
                     st.rerun()
-
-        # ==================== 2. 新增采购记录（放入 expander，修复 form 结构） ====================
+        # ==================== 2. 新增采购记录（放入 expander） ====================
         with st.expander("📥 新增采购记录", expanded=False):
             # ========== 饲料 ==========
             with st.form("feed_purchase_form"):
@@ -2485,9 +2433,7 @@ def run():
                         add_feed_purchase(fname, fprice, fqty, fsupp, fphone, current_user)
                         st.success(f"饲料「{fname}」已记录")
                         st.rerun()
-
             st.markdown("---")
-
             # ========== 蛙苗 ==========
             st.markdown("##### 🐸 蛙苗")
             input_mode = st.radio(
@@ -2496,7 +2442,6 @@ def run():
                 horizontal=True,
                 key="frog_input_mode"
             )
-
             if input_mode == "按只":
                 tqty = st.number_input("采购数量 (只)", min_value=0, step=50, value=0, key="frog_qty_zhi")
             else:
@@ -2507,7 +2452,6 @@ def run():
                     rate = st.number_input("每斤约等于多少只", min_value=1, max_value=20, value=4, step=1, key="frog_rate")
                 tqty = int(round(weight_jin * rate))
                 st.info(f"→ 自动换算为 **{tqty} 只**（{weight_jin} 斤 × {rate} 只/斤）")
-
             with st.form("frog_purchase_form"):
                 tname = st.text_input("蛙型名称", key="frog_name_input")
                 tprice = st.number_input("单价 (¥/只)", min_value=0.1, step=1.0, value=20.0, key="frog_price_input")
@@ -2541,7 +2485,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def get_frog_purchase_records(limit=20, offset=0):
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2555,7 +2498,6 @@ def run():
             rows = cur.fetchall()
             cur.close(); conn.close()
             return rows
-
         def count_feed_records():
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2563,7 +2505,6 @@ def run():
             cnt = cur.fetchone()[0]
             cur.close(); conn.close()
             return cnt
-
         def count_frog_records():
             conn = get_db_connection()
             cur = conn.cursor()
@@ -2571,10 +2512,8 @@ def run():
             cnt = cur.fetchone()[0]
             cur.close(); conn.close()
             return cnt
-
         PAGE_SIZE = 20
-
-                # ==================== 新增：报表查看 expander ====================
+        # ==================== 新增：报表查看 expander ====================
         with st.expander("📊 报表查看", expanded=False):
             # ========== 饲料采购流水记录（分页）==========
             st.markdown("##### 饲料采购流水")
@@ -2603,9 +2542,7 @@ def run():
                 st.dataframe(df_feed, width='stretch', hide_index=True)
             else:
                 st.info("暂无饲料采购流水记录")
-
             st.markdown("---")
-
             # ========== 蛙苗采购流水记录（分页）==========
             st.markdown("##### 蛙苗采购流水")
             total_frog = count_frog_records()
@@ -2633,9 +2570,7 @@ def run():
                 st.dataframe(df_frog, width='stretch', hide_index=True)
             else:
                 st.info("暂无蛙苗采购流水记录")
-
             st.markdown("---")
-
             # ========== 月度采购汇总 ==========
             st.markdown("##### 月度采购汇总")
             conn = get_db_connection()
@@ -2656,7 +2591,6 @@ def run():
                 ORDER BY 月份 DESC;
             """, conn)
             conn.close()
-
             col1, col2 = st.columns(2)
             with col1:
                 st.caption("饲料采购")
