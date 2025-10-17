@@ -1428,8 +1428,7 @@ def run():
                     except Exception as e:
                         st.error(f"❌ 发生未知错误：{e}")
 
-            # ---- 历史投喂总览（带分页）----
-            # ---- 历史投喂总览（带分页）----
+            # ---- 喂养记录总览（带分页）----
             st.markdown("### 📊 喂食总览（原始记录）")
             page_size = 20
 
@@ -1442,25 +1441,27 @@ def run():
             conn_count.close()
 
             total_pages = (total_feedings + page_size - 1) // page_size if total_feedings > 0 else 1
-
             if "feeding_page" not in st.session_state:
                 st.session_state.feeding_page = 0
+            current_page = max(0, min(st.session_state.feeding_page, total_pages - 1))
+            st.session_state.feeding_page = current_page
 
-            # 校验 current_page 在 [0, total_pages)
-            current_page = st.session_state.feeding_page
-            current_page = max(0, min(current_page, total_pages - 1))
-            st.session_state.feeding_page = current_page  # 确保状态合法
-            with col_prev:
+            # ✅ 独立的列变量
+            feed_col_prev, feed_col_next, feed_col_info = st.columns([1, 1, 3])
+            with feed_col_prev:
                 if st.button("⬅️ 上一页", disabled=(current_page == 0), key="feeding_prev"):
                     st.session_state.feeding_page -= 1
                     st.rerun()
-            with col_next:
-                if st.button("下一页 ➡️", key="feeding_next"):
+            with feed_col_next:
+                if st.button("下一页 ➡️", disabled=(current_page >= total_pages - 1), key="feeding_next"):
                     st.session_state.feeding_page += 1
                     st.rerun()
-            with col_info:
-                st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
+            with feed_col_info:
+                st.caption(f"第 {current_page + 1} 页 / 共 {total_pages} 页（每页 {page_size} 条）")
+
+            # 查询并显示数据
             offset = current_page * page_size
+            # ...（执行查询、渲染表格）
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("""
@@ -1586,11 +1587,10 @@ def run():
                         st.rerun()
 
             # ---- 历史日志列表（带分页）----
-            # ---- 历史日志列表（带分页）----
             st.markdown("### 📖 历史每日日志")
             page_size = 20
 
-            # 获取总记录数（用于计算总页数）
+            # 获取总记录数
             conn_count = get_db_connection()
             cur_count = conn_count.cursor()
             cur_count.execute("SELECT COUNT(*) FROM daily_log_shiwa;")
@@ -1599,25 +1599,27 @@ def run():
             conn_count.close()
 
             total_pages = (total_logs + page_size - 1) // page_size if total_logs > 0 else 1
-
             if "daily_log_page" not in st.session_state:
                 st.session_state.daily_log_page = 0
+            current_page = max(0, min(st.session_state.daily_log_page, total_pages - 1))
+            st.session_state.daily_log_page = current_page
 
-            # 校验 current_page 在 [0, total_pages)
-            current_page = st.session_state.daily_log_page
-            current_page = max(0, min(current_page, total_pages - 1))
-            st.session_state.daily_log_page = current_page  # 确保状态合法
-            with col_prev:
+            # ✅ 独立的列变量
+            log_col_prev, log_col_next, log_col_info = st.columns([1, 1, 3])
+            with log_col_prev:
                 if st.button("⬅️ 上一页", disabled=(current_page == 0), key="daily_log_prev"):
                     st.session_state.daily_log_page -= 1
                     st.rerun()
-            with col_next:
-                if st.button("下一页 ➡️", key="daily_log_next"):
+            with log_col_next:
+                if st.button("下一页 ➡️", disabled=(current_page >= total_pages - 1), key="daily_log_next"):
                     st.session_state.daily_log_page += 1
                     st.rerun()
-            with col_info:
-                st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
+            with log_col_info:
+                st.caption(f"第 {current_page + 1} 页 / 共 {total_pages} 页（每页 {page_size} 条）")
+
+            # 查询并显示数据
             offset = current_page * page_size
+            # ...（执行查询、渲染表格）
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("""
@@ -2811,20 +2813,19 @@ def run():
                                 width='stretch', hide_index=True)
                 else:
                     st.info("暂无蛙型采购记录")
-    # Tab 6: 销售记录（按斤销售，保留原始斤数）
-    # -----------------------------
+        # -----------------------------tab6 销售模块
     with tab6:
         st.subheader("💰 销售记录（按斤计算，1只 ≈ 4斤）")
         ponds = get_all_ponds()
+        sale_error = None  # ← 用于收集错误，不中断渲染
+
         if not ponds:
             st.warning("暂无可销售池塘")
-            # 不 stop，继续渲染历史记录
         else:
             SALEABLE_POND_TYPES = ["商品蛙池", "三年蛙池", "四年蛙池", "五年蛙池", "六年蛙池", "种蛙池"]
             cand = [p for p in ponds if p[2] in SALEABLE_POND_TYPES and p[5] > 0]
             if not cand:
                 st.info("没有可销售的蛙（仅显示：商品蛙池、三年~六年蛙池）")
-                # 不 stop，继续渲染历史记录
             else:
                 # ========== 池塘选择 ==========
                 st.markdown("#### 📋 待销售池塘清单（点击选择）")
@@ -2835,10 +2836,8 @@ def run():
                     label = f"[{frog_type}] {name}（{pond_type}｜现存 {current} 只 ≈ {current * 4} 斤）"
                     pond_options.append(label)
                     pond_id_list.append(pid)
-
                 if "selected_sale_pond_id" not in st.session_state:
                     st.session_state.selected_sale_pond_id = pond_id_list[0]
-
                 selected_label = st.radio(
                     "选择要销售的池塘",
                     options=pond_options,
@@ -2847,11 +2846,9 @@ def run():
                 )
                 selected_pond_id = pond_id_list[pond_options.index(selected_label)]
                 st.session_state.selected_sale_pond_id = selected_pond_id
-
                 info = next(p for p in cand if p[0] == selected_pond_id)
                 st.info(f"✅ 已选：{info[1]}｜类型：{info[2]}｜蛙种：{info[3]}｜库存：{info[5]} 只（≈ {info[5] * 4} 斤）")
                 st.markdown("---")
-
                 # ========== 客户选择 ==========
                 st.markdown("#### 1. 选择客户")
                 customers = get_customers() or []
@@ -2862,7 +2859,6 @@ def run():
                 new_cust = cust_sel == "新建客户"
                 with c2:
                     sale_type = st.radio("销售类型", ["零售", "批发"], horizontal=True, key="sale_type")
-
                 customer_id = None
                 if new_cust:
                     with st.form("new_customer"):
@@ -2871,10 +2867,8 @@ def run():
                         phone = st.text_input("电话", max_chars=20)
                         if st.form_submit_button("添加客户"):
                             if not name.strip():
-                                st.error("请输入客户姓名！")
+                                sale_error = "请输入客户姓名！"
                             else:
-                                # 把联系人拼到备注里，或单独加字段均可
-                                # 方案1：拼成 “名称（联系人）” 存入 name
                                 full_name = f"{name.strip()}（{contact.strip()}）" if contact.strip() else name.strip()
                                 customer_id = add_customer(full_name, phone, sale_type)
                                 st.success(f"✅ 客户 {full_name} 已创建")
@@ -2882,12 +2876,8 @@ def run():
                 else:
                     if customers:
                         customer_id = customers[cust_opt.index(cust_sel) - 1][0]
-
-                # ========== 仅当客户有效时，才显示销售表单 ==========
-                if customer_id is None:
-                    st.info("请选择或创建客户后再进行销售操作")
-                else:
-                    # 显示客户信息
+                # ========== 销售表单 ==========
+                if customer_id is not None:
                     conn = get_db_connection()
                     cur = conn.cursor()
                     cur.execute("SELECT name, phone, type FROM customer_shiwa WHERE id = %s;", (customer_id,))
@@ -2899,92 +2889,94 @@ def run():
                         phone_str = f"｜电话：{phone}" if phone else ""
                         st.info(f"已选客户：{name}（{ctype}）{phone_str}")
 
-                                    # ========== 销售表单（按斤，动态换算）==========
-                st.markdown("#### 2. 销售明细（按实际称重斤数，自动换算扣库存只数）")
-                with st.form("sale_form"):
-                    pond_id = st.session_state.selected_sale_pond_id
-                    pond_info = next(c for c in cand if c[0] == pond_id)
-                    max_zhi = pond_info[5]  # 当前库存只数
-
-                    # --- 新增：每只多少斤（默认 0.25 斤/只）---
-                    weight_per_frog = st.number_input(
-                        "每只约多少斤（建议 0.2~0.3）",
-                        min_value=0.01,
-                        max_value=1.0,
-                        value=0.25,
-                        step=0.01,
-                        format="%.2f"
-                    )
-
-                    # --- 销售重量（斤）---
-                    weight_jin = st.number_input(
-                        "实际称重销售重量 (斤)",
-                        min_value=0.1,
-                        step=0.1,
-                        value=min(10.0, max_zhi * weight_per_frog)  # 默认最多卖 10 斤或全部
-                    )
-
-                    # --- 自动换算只数 ---
-                    if weight_per_frog <= 0:
-                        quantity_zhi = 0
-                    else:
-                        quantity_zhi = round(weight_jin / weight_per_frog)
-
-                    # --- 校验 ---
-                    if quantity_zhi <= 0:
-                        st.error("换算后数量 ≤ 0，请检查输入！")
-                        st.form_submit_button("✅ 确认销售", disabled=True)
-                    elif quantity_zhi > max_zhi:
-                        st.error(f"❌ 换算后需扣 {quantity_zhi} 只，但库存仅 {max_zhi} 只！")
-                        st.form_submit_button("✅ 确认销售", disabled=True)
-                    else:
-                        st.info(f"→ **将扣减库存：{quantity_zhi} 只**（称重 {weight_jin} 斤 ÷ {weight_per_frog} 斤/只 ≈ {weight_jin / weight_per_frog:.2f} 只 → 四舍五入）")
-
-                        # --- 单价（按斤）---
-                        default_price_per_jin = 60.0 if sale_type == "零售" else 45.0  # 示例：零售 60元/斤
-                        price_per_jin = st.number_input(
-                            "单价 (元/斤)",
-                            min_value=0.1,
-                            value=default_price_per_jin,
-                            step=0.5
+                    st.markdown("#### 2. 销售明细（按实际称重斤数，自动换算扣库存只数）")
+                    with st.form("sale_form"):
+                        pond_id = st.session_state.selected_sale_pond_id
+                        pond_info = next(c for c in cand if c[0] == pond_id)
+                        max_zhi = pond_info[5]
+                        weight_per_frog = st.number_input(
+                            "每只约多少斤（建议 0.2~0.3）",
+                            min_value=0.01,
+                            max_value=1.0,
+                            value=0.25,
+                            step=0.01,
+                            format="%.2f"
                         )
+                        weight_jin = st.number_input(
+                            "实际称重销售重量 (斤)",
+                            min_value=0.1,
+                            step=0.1,
+                            value=min(10.0, max_zhi * weight_per_frog)
+                        )
+                        if weight_per_frog <= 0:
+                            quantity_zhi = 0
+                        else:
+                            quantity_zhi = round(weight_jin / weight_per_frog)
 
-                        note = st.text_area("备注")
-                        submitted = st.form_submit_button("✅ 确认销售", type="primary")
-                        if submitted:
-                            current_user = st.session_state.user['username']
-                            # 调用 do_sale：传入只数、单价（元/只 = 元/斤 × 斤/只）
-                            unit_price_per_zhi = price_per_jin * weight_per_frog
-                            do_sale(
-                                pond_id=pond_id,
-                                customer_id=customer_id,
-                                sale_type=sale_type,
-                                qty_zhi=quantity_zhi,
-                                unit_price_per_zhi=unit_price_per_zhi,
-                                weight_jin=weight_jin,  # 原始称重斤数，用于记录
-                                note=note,
-                                sold_by=current_user
+                        if quantity_zhi <= 0:
+                            st.error("换算后数量 ≤ 0，请检查输入！")
+                            st.form_submit_button("✅ 确认销售", disabled=True)
+                        elif quantity_zhi > max_zhi:
+                            st.error(f"❌ 换算后需扣 {quantity_zhi} 只，但库存仅 {max_zhi} 只！")
+                            st.form_submit_button("✅ 确认销售", disabled=True)
+                        else:
+                            st.info(f"→ **将扣减库存：{quantity_zhi} 只**（称重 {weight_jin} 斤 ÷ {weight_per_frog} 斤/只）")
+                            default_price_per_jin = 60.0 if sale_type == "零售" else 45.0
+                            price_per_jin = st.number_input(
+                                "单价 (元/斤)",
+                                min_value=0.1,
+                                value=default_price_per_jin,
+                                step=0.5
                             )
-                            total_yuan = weight_jin * price_per_jin
-                            st.success(f"✅ 销售成功：{weight_jin} 斤 × {price_per_jin} 元/斤 = **{total_yuan:.2f} 元**")
-                            st.rerun()
+                            note = st.text_area("备注")
+                            submitted = st.form_submit_button("✅ 确认销售", type="primary")
+                            if submitted:
+                                current_user = st.session_state.user['username']
+                                unit_price_per_zhi = price_per_jin * weight_per_frog
+                                do_sale(
+                                    pond_id=pond_id,
+                                    customer_id=customer_id,
+                                    sale_type=sale_type,
+                                    qty_zhi=quantity_zhi,
+                                    unit_price_per_zhi=unit_price_per_zhi,
+                                    weight_jin=weight_jin,
+                                    note=note,
+                                    sold_by=current_user
+                                )
+                                total_yuan = weight_jin * price_per_jin
+                                st.success(f"✅ 销售成功：{weight_jin} 斤 × {price_per_jin} 元/斤 = **{total_yuan:.2f} 元**")
+                                st.rerun()
+
         # ========== 销售记录总览（始终显示）==========
         st.markdown("#### 3. 最近销售记录")
         page_size = 20
         if "sale_page" not in st.session_state:
             st.session_state.sale_page = 0
-        col_prev, col_next, col_info = st.columns([1, 1, 3])
+
+        # 获取总记录数
+        conn_count = get_db_connection()
+        cur_count = conn_count.cursor()
+        cur_count.execute("SELECT COUNT(*) FROM sale_record_shiwa;")
+        total_sales = cur_count.fetchone()[0]
+        cur_count.close()
+        conn_count.close()
+
+        total_pages = (total_sales + page_size - 1) // page_size if total_sales > 0 else 1
         current_page = st.session_state.sale_page
+        current_page = max(0, min(current_page, total_pages - 1))
+        st.session_state.sale_page = current_page
+
+        col_prev, col_next, col_info = st.columns([1, 1, 3])
         with col_prev:
             if st.button("⬅️ 上一页", disabled=(current_page == 0), key="sale_prev"):
                 st.session_state.sale_page -= 1
                 st.rerun()
         with col_next:
-            if st.button("下一页 ➡️", key="sale_next"):
+            if st.button("下一页 ➡️", disabled=(current_page >= total_pages - 1), key="sale_next"):
                 st.session_state.sale_page += 1
                 st.rerun()
         with col_info:
-            st.caption(f"第 {current_page + 1} 页（每页 {page_size} 条）")
+            st.caption(f"第 {current_page + 1} 页 / 共 {total_pages} 页（每页 {page_size} 条）")
 
         offset = current_page * page_size
         conn = get_db_connection()
@@ -3007,21 +2999,25 @@ def run():
                 rows,
                 columns=["ID", "池塘", "客户", "类型", "数量_只", "单价_元每只", "总金额", "时间", "备注", "原始斤数", "销售人"]
             )
-            # 兜底：如果 weight_jin 为 NULL（旧记录），用 quantity * 4
+            # ✅ 修复：正确计算“元/斤” = 总金额 / 原始斤数（若原始斤数为 NULL，则用 4 斤/只估算）
+            def calc_price_per_jin(row):
+                if pd.notna(row["原始斤数"]) and row["原始斤数"] > 0:
+                    return row["总金额"] / row["原始斤数"]
+                else:
+                    return row["单价_元每只"] / 4  # 兜底
+            df["单价_元每斤"] = df.apply(calc_price_per_jin, axis=1)
             df["重量_斤"] = df["原始斤数"].fillna(df["数量_只"] * 4)
-            df["单价_元每斤"] = df["单价_元每只"] / 4
-            df_display = df[["池塘", "客户", "类型", "重量_斤", "单价_元每斤", "总金额", "销售人", "时间", "备注"]]
 
+            df_display = df[["池塘", "客户", "类型", "重量_斤", "单价_元每斤", "总金额", "销售人", "时间", "备注"]]
             st.dataframe(
                 df_display.style.format({
                     "重量_斤": "{:.2f} 斤",
-                    "单价_元每斤": "¥{:.2f}/斤",
+                    "单价_元每斤": "¥{:.2f}/斤",   # ← 直接显示正确单价
                     "总金额": "¥{:.2f}"
                 }),
                 width='stretch',
                 hide_index=True
             )
-
             csv = df_display.to_csv(index=False)
             st.download_button(
                 "📥 导出当前页 CSV",
