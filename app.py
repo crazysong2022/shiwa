@@ -533,10 +533,10 @@ def add_stock_movement(movement_type, from_pond_id, to_pond_id, quantity,
             # 插入 movement
             cur.execute("""
                 INSERT INTO stock_movement_shiwa
-                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (movement_type, from_pond_id, to_pond_id, quantity, description, unit_price, created_by, moved_at, frog_purchase_type_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
-            """, ('purchase', None, to_pond_id, quantity, description, unit_price, created_by, actual_moved_at))
+            """, ('purchase', None, to_pond_id, quantity, description, unit_price, created_by, actual_moved_at, frog_type_id))
             movement_id = cur.fetchone()[0]
             _log_life_start(conn, movement_id, to_pond_id, quantity, 'purchase')
         
@@ -1093,19 +1093,18 @@ def show_login_page():
 def get_frog_allocation_records(name):
     """
     获取指定蛙苗名称的所有外购分配（出库）记录
-    通过：frog_type_name → frog_type_id → pond.frog_type_id → stock_movement.to_pond_id
+    通过：frog_type_name → frog_purchase_type_shiwa.id → stock_movement_shiwa.frog_purchase_type_id
     """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 先获取 frog_type_id
-        cur.execute("SELECT id FROM frog_type_shiwa WHERE name = %s;", (name,))
-        frog_type_row = cur.fetchone()
-        if not frog_type_row:
+        # 先获取 frog_purchase_type_shiwa.id
+        cur.execute("SELECT id FROM frog_purchase_type_shiwa WHERE name = %s;", (name,))
+        row = cur.fetchone()
+        if not row:
             return []
-        frog_type_id = frog_type_row[0]
-
-        # 查询所有分配到 frog_type_id 池塘的 purchase movement
+        frog_purchase_type_id = row[0]
+        # 通过 frog_purchase_type_id 精确查询出库记录
         cur.execute("""
             SELECT 
                 sm.moved_at,
@@ -1118,9 +1117,9 @@ def get_frog_allocation_records(name):
             FROM stock_movement_shiwa sm
             JOIN pond_shiwa p ON sm.to_pond_id = p.id
             WHERE sm.movement_type = 'purchase'
-              AND p.frog_type_id = %s
+              AND sm.frog_purchase_type_id = %s
             ORDER BY sm.moved_at DESC;
-        """, (frog_type_id,))
+        """, (frog_purchase_type_id,))
         rows = cur.fetchall()
         return rows
     finally:
@@ -2503,25 +2502,8 @@ def run():
                 """, (name,))
                 purchase_records = cur.fetchall()
 
-                # 2. 获取外购分配出库记录（通过 frog_type_id 关联）
-                # 直接通过 description 包含 "[{name}]" 来匹配
-                search_pattern = f"[{name}]%"
-                cur.execute("""
-                    SELECT 
-                        sm.moved_at,
-                        p.name AS pond_name,
-                        sm.quantity,
-                        sm.unit_price,
-                        (sm.quantity * COALESCE(sm.unit_price, 20.0)) AS total_cost,
-                        sm.created_by,
-                        sm.description
-                    FROM stock_movement_shiwa sm
-                    JOIN pond_shiwa p ON sm.to_pond_id = p.id
-                    WHERE sm.movement_type = 'purchase'
-                    AND sm.description LIKE %s
-                    ORDER BY sm.moved_at DESC;
-                """, (search_pattern,))
-                allocation_records = cur.fetchall()
+                # 2. 获取外购分配出库记录（通过 frog_purchase_type_id 精确匹配）
+                allocation_records = get_frog_allocation_records(name)
                 cur.close()
                 conn.close()
 

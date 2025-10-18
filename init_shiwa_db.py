@@ -32,7 +32,8 @@ def get_conn():
 def column_exists(cur, table_name, column_name):
     cur.execute("""
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = %s AND column_name = %s;
+        WHERE table_schema = 'public'
+        AND table_name = %s AND column_name = %s;
     """, (table_name, column_name))
     return cur.fetchone() is not None
 
@@ -44,8 +45,8 @@ def main():
     with get_conn() as conn:
         with conn.cursor() as cur:
 
-            # ========== 1. 创建基础表（IF NOT EXISTS）==========
-            tables_sql = [
+            # ========== 1. 创建基础表（不含依赖 stock_movement_shiwa 的表）==========
+            base_tables = [
                 # user_shiwa
                 """
                 CREATE TABLE IF NOT EXISTS user_shiwa (
@@ -174,14 +175,6 @@ def main():
                     sold_by VARCHAR(50)
                 );
                 """,
-                # death_image_shiwa
-                """
-                CREATE TABLE IF NOT EXISTS death_image_shiwa (
-                    id SERIAL PRIMARY KEY,
-                    death_movement_id INTEGER REFERENCES stock_movement_shiwa(id) ON DELETE CASCADE,
-                    image_path TEXT NOT NULL
-                );
-                """,
                 # pond_life_cycle_shiwa
                 """
                 CREATE TABLE IF NOT EXISTS pond_life_cycle_shiwa (
@@ -218,42 +211,10 @@ def main():
                 """,
             ]
 
-            for sql in tables_sql:
+            for sql in base_tables:
                 cur.execute(sql)
 
-            # ========== 2. 重点：升级 feed_purchase_record_shiwa ==========
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS feed_purchase_record_shiwa (
-                    id SERIAL PRIMARY KEY,
-                    feed_type_name VARCHAR(100) NOT NULL,
-                    quantity_kg NUMERIC(12,2) NOT NULL,
-                    unit_price NUMERIC(10,2) NOT NULL,
-                    total_amount NUMERIC(14,2) GENERATED ALWAYS AS (quantity_kg * unit_price) STORED,
-                    supplier VARCHAR(100),
-                    supplier_phone VARCHAR(50),
-                    purchased_by VARCHAR(50),
-                    purchased_at TIMESTAMP DEFAULT NOW(),
-                    notes TEXT
-                );
-            """)
-
-            # ========== 3. 重点：升级 frog_purchase_record_shiwa ==========
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS frog_purchase_record_shiwa (
-                    id SERIAL PRIMARY KEY,
-                    frog_type_name VARCHAR(100) NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    unit_price NUMERIC(10,2) NOT NULL,
-                    total_amount NUMERIC(14,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
-                    supplier VARCHAR(100),
-                    supplier_phone VARCHAR(50),
-                    purchased_by VARCHAR(50),
-                    purchased_at TIMESTAMP DEFAULT NOW(),
-                    notes TEXT
-                );
-            """)
-
-            # ========== 4. 重点：创建/升级 stock_movement_shiwa ==========
+            # ========== 2. 创建 stock_movement_shiwa（关键：提前创建）==========
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS stock_movement_shiwa (
                     id SERIAL PRIMARY KEY,
@@ -269,6 +230,46 @@ def main():
                 );
             """)
 
+            # ========== 3. 创建依赖 stock_movement_shiwa 的表 ==========
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS death_image_shiwa (
+                    id SERIAL PRIMARY KEY,
+                    death_movement_id INTEGER REFERENCES stock_movement_shiwa(id) ON DELETE CASCADE,
+                    image_path TEXT NOT NULL
+                );
+            """)
+
+            # ========== 4. 创建采购记录表 ==========
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feed_purchase_record_shiwa (
+                    id SERIAL PRIMARY KEY,
+                    feed_type_name VARCHAR(100) NOT NULL,
+                    quantity_kg NUMERIC(12,2) NOT NULL,
+                    unit_price NUMERIC(10,2) NOT NULL,
+                    total_amount NUMERIC(14,2) GENERATED ALWAYS AS (quantity_kg * unit_price) STORED,
+                    supplier VARCHAR(100),
+                    supplier_phone VARCHAR(50),
+                    purchased_by VARCHAR(50),
+                    purchased_at TIMESTAMP DEFAULT NOW(),
+                    notes TEXT
+                );
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS frog_purchase_record_shiwa (
+                    id SERIAL PRIMARY KEY,
+                    frog_type_name VARCHAR(100) NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price NUMERIC(10,2) NOT NULL,
+                    total_amount NUMERIC(14,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+                    supplier VARCHAR(100),
+                    supplier_phone VARCHAR(50),
+                    purchased_by VARCHAR(50),
+                    purchased_at TIMESTAMP DEFAULT NOW(),
+                    notes TEXT
+                );
+            """)
+
             # ========== 5. 自动修复：检查缺失字段并添加 ==========
             # 5.1 feed_purchase_record_shiwa.notes
             if not column_exists(cur, 'feed_purchase_record_shiwa', 'notes'):
@@ -278,7 +279,7 @@ def main():
             if not column_exists(cur, 'frog_purchase_record_shiwa', 'notes'):
                 cur.execute("ALTER TABLE frog_purchase_record_shiwa ADD COLUMN notes TEXT;")
 
-            # 5.3 stock_movement_shiwa.frog_purchase_type_id
+            # 5.3 stock_movement_shiwa.frog_purchase_type_id（关键字段）
             if not column_exists(cur, 'stock_movement_shiwa', 'frog_purchase_type_id'):
                 cur.execute("""
                     ALTER TABLE stock_movement_shiwa
