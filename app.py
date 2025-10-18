@@ -2836,12 +2836,21 @@ def run():
                     label = f"[{frog_type}] {name}（{pond_type}｜现存 {current} 只 ≈ {current * 4} 斤）"
                     pond_options.append(label)
                     pond_id_list.append(pid)
-                if "selected_sale_pond_id" not in st.session_state:
+                # 安全初始化：确保 selected_sale_pond_id 在当前可选范围内
+                if "selected_sale_pond_id" not in st.session_state or st.session_state.selected_sale_pond_id not in pond_id_list:
+                    st.session_state.selected_sale_pond_id = pond_id_list[0]  # 默认选第一个
+
+                # 获取当前选中池塘在列表中的索引
+                try:
+                    current_index = pond_id_list.index(st.session_state.selected_sale_pond_id)
+                except ValueError:
+                    current_index = 0
                     st.session_state.selected_sale_pond_id = pond_id_list[0]
+
                 selected_label = st.radio(
                     "选择要销售的池塘",
                     options=pond_options,
-                    index=pond_id_list.index(st.session_state.selected_sale_pond_id),
+                    index=current_index,
                     key="sale_pond_radio"
                 )
                 selected_pond_id = pond_id_list[pond_options.index(selected_label)]
